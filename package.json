@@ -1,0 +1,37 @@
+{
+  "name": "@lkonga/opencode-agentgrep",
+  "version": "0.1.0",
+  "description": "OpenCode plugin: code search and retrieval via the agentgrep CLI (pinned v0.1.6) — grep, find, outline, trace, with native path permissions and bounded execution",
+  "type": "module",
+  "main": "./index.ts",
+  "files": [
+    "index.ts",
+    "agentgrep-core.ts",
+    "agentgrep-types.ts",
+    "agentgrep-args.ts",
+    "agentgrep-tools.ts",
+    "agentgrep-paths.ts",
+    "agentgrep-exec.ts",
+    "scripts/install-agentgrep.sh",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lkonga/opencode-agentgrep-plugin.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "typecheck": "bunx tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "1.18.21"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.1.0",
+    "typescript": "^5.6.0"
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "types": ["bun"],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "allowImportingTsExtensions": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": [
+    "index.ts",
+    "agentgrep-core.ts",
+    "agentgrep-types.ts",
+    "agentgrep-args.ts",
+    "agentgrep-tools.ts",
+    "agentgrep-paths.ts",
+    "agentgrep-exec.ts",
+    "agentgrep.test.ts",
+    "agentgrep-execute.test.ts"
+  ]
+}
