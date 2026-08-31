@@ -6,6 +6,7 @@
       "name": "@lkonga/opencode-agentgrep",
       "dependencies": {
         "@opencode-ai/plugin": "1.18.21",
+        "@opencode-ai/sdk": "1.18.21",
       },
       "devDependencies": {
         "@types/bun": "^1.1.0",

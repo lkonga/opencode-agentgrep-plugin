@@ -13,13 +13,26 @@
   },
   "include": [
     "index.ts",
+    "tui.ts",
     "agentgrep-core.ts",
     "agentgrep-types.ts",
     "agentgrep-args.ts",
     "agentgrep-tools.ts",
     "agentgrep-paths.ts",
     "agentgrep-exec.ts",
+    "agentgrep-guidance.ts",
+    "agentgrep-context.ts",
+    "agentgrep-context-schema.ts",
+    "agentgrep-context-build.ts",
+    "agentgrep-context-sdk.ts",
+    "agentgrep-context-sqlite.ts",
+    "agentgrep-context-temp.ts",
+    "agentgrep-context-caps.ts",
+    "agentgrep-context-bytes.ts",
+    "agentgrep-context-sanitize.ts",
     "agentgrep.test.ts",
-    "agentgrep-execute.test.ts"
+    "agentgrep-execute.test.ts",
+    "agentgrep-context.test.ts",
+    "agentgrep-tui.test.ts"
   ]
 }

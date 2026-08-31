@@ -281,11 +281,12 @@ describe("ToolDefinition.execute smoke (fake agentgrep bin)", () => {
     }
   })
 
-  test("file_grep alias executes with grep semantics", async () => {
+  test("file_grep alias (opt-in registry) executes with grep semantics", async () => {
+    const optInTools = buildAgentGrepTools(undefined, { legacyAliases: true })
     const { ctx } = makeCtx()
     try {
       fs.writeFileSync(harness.record, "")
-      const res = asResult(await tools.file_grep.execute({ query: "x" }, ctx))
+      const res = asResult(await optInTools.file_grep.execute({ query: "x" }, ctx))
       expect(res.metadata.ok).toBe(true)
       expect(lastArgv()[0]).toBe("grep")
     } finally {

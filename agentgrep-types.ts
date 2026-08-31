@@ -20,8 +20,26 @@
 export const AGENTGREP_CANONICAL_ID = "agentgrep"
 export const AGENTGREP_FIND_ID = "find"
 
-/** Legacy alias ids registered on the model-facing registry (exact case). */
+/** Legacy alias ids registered on the model-facing registry (exact case) when opt-in. */
 export const AGENTGREP_ALIASES: ReadonlyArray<string> = ["file_grep", "Grep"] as const
+
+/**
+ * Typed registry options for the tool builder. Passed via `buildAgentGrepTools`
+ * or resolved from the `$AGENTGREP_LEGACY_ALIASES` environment variable.
+ */
+export interface AgentGrepRegistryOptions {
+  /**
+   * Register the legacy compatibility aliases `file_grep` and `Grep` (exact
+   * case) on the model-facing registry. Defaults to false; the default registry
+   * exposes only canonical `agentgrep` and the first-class `find` shortcut.
+   */
+  legacyAliases?: boolean
+}
+
+/** Resolve legacy-alias opt-in from explicit options or the env var. */
+export function legacyAliasesEnabled(opts?: AgentGrepRegistryOptions): boolean {
+  return opts?.legacyAliases === true || process.env.AGENTGREP_LEGACY_ALIASES === "1"
+}
 
 /**
  * Pure helper mirroring jcode's normalization for callers/adapters.
@@ -98,6 +116,13 @@ export interface AgentGrepInput {
    * public zod schema.
    */
   __fileScope?: { root: string; glob: string }
+  /**
+   * Internal: absolute path to a harness context JSON file written by the
+   * secure temp helper, threaded into argv ONLY as `--context-json`. Only
+   * trace/smart/outline executions set/pass it. Never exposed in the public
+   * zod schema and never surfaced through permission asks / results / metadata.
+   */
+  __contextJson?: string
 }
 
 /** Match-all glob forms that must mean "no filter" (jcode is_match_all_glob). */

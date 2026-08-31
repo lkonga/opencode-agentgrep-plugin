@@ -4,9 +4,12 @@
 
 | You changed | Do this | Version string in TUI |
 |-------------|---------|------------------------|
-| `index.ts`, `agentgrep-*.ts`, README | **Restart `oc`** (or new session) | **Unchanged** — still the fork binary version |
-| Schema / argv behavior | Run `bun test` + `bunx tsc --noEmit` first | — |
+| `index.ts`, `tui.ts`, `agentgrep-*.ts` (incl. `agentgrep-context*`, `agentgrep-guidance.ts`), README | **Restart `oc`** (or new session) | **Unchanged** — still the fork binary version |
+| Schema / argv / context / guidance behavior | Run `bun test` + `bunx tsc --noEmit` first | — |
 | Real-CLI behavior | Re-run the smoke suite (needs `~/.local/bin/agentgrep`) | — |
+| End-to-end harness-context (`--context-json`) | `OC_SMOKE_MODEL=<provider/model> bash scripts/smoke-oc-context.sh` | — |
+| Tool-selection smoke | `OC_SMOKE_MODEL=<provider/model> bash scripts/smoke-oc-selection.sh` | — |
+| TUI facade (`tui.ts`) | Verify in TUI: `/agentgrep` command + toast; TUI Plugins screen shows the plugin | **Needs** tui.json entry (see README) |
 
 The agentgrep plugin is loaded as a **`file:///…/opencode-agentgrep` directory
 plugin** in `opencode.json` — loaded at runtime, no rebuild needed. A `git tag`

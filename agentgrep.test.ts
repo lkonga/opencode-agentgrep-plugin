@@ -14,9 +14,13 @@ import {
   AGENTGREP_ALIASES,
   AGENTGREP_CANONICAL_ID,
   AGENTGREP_FIND_ID,
+  AGENTGREP_GUIDANCE_MARKER,
+  agentgrepSystemGuidance,
+  applyAgentGrepSystemGuidance,
   buildAgentGrepArgs,
   buildAgentGrepTools,
   exactFileScope,
+  legacyAliasesEnabled,
   normalizeAgentGrepMode,
   normalizeMatchAllGlob,
   operationPatterns,
@@ -26,6 +30,20 @@ import {
 } from "./agentgrep-core"
 // The default plugin is loaded from the entrypoint, exactly as OpenCode does.
 import agentGrepPlugin from "./index"
+
+// Minimal PluginInput stub so the loader function can be invoked in tests.
+// (The loader now threads `PluginInput` into buildAgentGrepTools.)
+function makePluginInput(): any {
+  return {
+    client: {},
+    directory: "",
+    worktree: "",
+    project: {},
+    experimental_workspace: { register() {} },
+    serverUrl: new URL("http://localhost:4096"),
+    $: undefined,
+  }
+}
 
 // ── Entrypoint / registration ────────────────────────────────────────────────
 
@@ -38,18 +56,32 @@ describe("entrypoint module shape (loader constraint)", () => {
     expect(typeof mod.default).toBe("function")
   })
 
-  test("default plugin registers canonical + aliases + find, never bare grep/glob", async () => {
-    const hooks = await agentGrepPlugin()
-    expect(Object.keys(hooks.tool)).toEqual(["agentgrep", "file_grep", "Grep", "find"])
+  test("default plugin registers canonical agentgrep + find only (no bare grep/glob, no legacy aliases)", async () => {
+    const hooks = await agentGrepPlugin(makePluginInput())
+    expect(Object.keys(hooks.tool)).toEqual(["agentgrep", "find"])
     for (const id of Object.keys(hooks.tool)) {
       expect(hooks.tool[id].description).toContain("agentgrep")
       expect(typeof hooks.tool[id].execute).toBe("function")
     }
   })
+
+  test("default plugin exposes the idempotent local code-search system guidance hook", async () => {
+    const hooks = await agentGrepPlugin(makePluginInput())
+    const transform = hooks["experimental.chat.system.transform"]
+    expect(typeof transform).toBe("function")
+    const output = { system: ["existing"] }
+    await transform!({ sessionID: "s", model: {} as never }, output)
+    expect(output.system[0]).toBe("existing")
+    expect(output.system.some((s) => s.includes(AGENTGREP_GUIDANCE_MARKER))).toBe(true)
+    const before = output.system.length
+    await transform!({ sessionID: "s", model: {} as never }, output)
+    expect(output.system.length).toBe(before) // idempotent: no duplicate guidance
+  })
 })
 
 describe("tool registration ids", () => {
   const tools = buildAgentGrepTools()
+  const optInTools = buildAgentGrepTools(undefined, { legacyAliases: true })
 
   test("canonical agentgrep is registered", () => {
     expect(Object.keys(tools)).toContain(AGENTGREP_CANONICAL_ID)
@@ -58,12 +90,32 @@ describe("tool registration ids", () => {
     expect(tools.agentgrep.args).toBeTruthy()
   })
 
-  test("legacy aliases file_grep and Grep are registered (exact case)", () => {
+  test("legacy aliases are NOT registered by default, but ARE via the typed opt-in (exact case)", () => {
+    // Default registry: no legacy aliases.
     for (const alias of AGENTGREP_ALIASES) {
-      expect(Object.keys(tools)).toContain(alias)
-      expect(tools[alias].description).toBeTruthy()
-      expect(typeof tools[alias].execute).toBe("function")
+      expect(Object.keys(tools), `${alias} must be absent by default`).not.toContain(alias)
     }
+    // Typed opt-in registers BOTH exact-case ids.
+    for (const alias of AGENTGREP_ALIASES) {
+      expect(Object.keys(optInTools)).toContain(alias)
+      expect(optInTools[alias].description).toContain("agentgrep")
+      expect(optInTools[alias].description).toMatch(/compatibilit|Prefer/i)
+      expect(typeof optInTools[alias].execute).toBe("function")
+    }
+  })
+
+  test("AGENTGREP_LEGACY_ALIASES=1 env opt-in registers the exact-case legacy aliases", () => {
+    const prev = process.env.AGENTGREP_LEGACY_ALIASES
+    try {
+      process.env.AGENTGREP_LEGACY_ALIASES = "1"
+      const envTools = buildAgentGrepTools()
+      expect(Object.keys(envTools)).toEqual(["agentgrep", "find", "file_grep", "Grep"])
+      expect(legacyAliasesEnabled()).toBe(true)
+    } finally {
+      if (prev === undefined) delete process.env.AGENTGREP_LEGACY_ALIASES
+      else process.env.AGENTGREP_LEGACY_ALIASES = prev
+    }
+    expect(legacyAliasesEnabled()).toBe(false)
   })
 
   test("first-class find id is registered with forced find semantics", () => {
@@ -74,12 +126,15 @@ describe("tool registration ids", () => {
     expect(Object.keys(findTool.args ?? {})).not.toContain("mode")
   })
 
-  test("grep id AND glob id are deliberately ABSENT from the registry", () => {
+  test("grep id AND glob id are deliberately ABSENT (default and opt-in)", () => {
     // tools.grep=false / tools.glob=false filter any tool with those ids — a
     // grep/glob-id plugin alias would be unreachable. Do not regress this.
-    expect(Object.keys(tools)).not.toContain("grep")
-    expect(Object.keys(tools)).not.toContain("glob")
-    expect(Object.keys(tools)).toEqual(["agentgrep", "file_grep", "Grep", "find"])
+    for (const registry of [tools, optInTools]) {
+      expect(Object.keys(registry)).not.toContain("grep")
+      expect(Object.keys(registry)).not.toContain("glob")
+    }
+    expect(Object.keys(tools)).toEqual(["agentgrep", "find"])
+    expect(Object.keys(optInTools)).toEqual(["agentgrep", "find", "file_grep", "Grep"])
   })
 
   test("args use tool.schema (zod v4) shapes the server registry recognizes", () => {
@@ -184,6 +239,74 @@ describe("resolveAgentGrepToolID (jcode mirror)", () => {
     expect(resolveAgentGrepToolID("glob")).toBeNull()
     expect(resolveAgentGrepToolID("greps")).toBeNull()
     expect(resolveAgentGrepToolID("")).toBeNull()
+  })
+})
+
+// ── Tool descriptions (selection clarity) ────────────────────────────────────
+
+describe("tool descriptions are unambiguous for tool selection", () => {
+  const tools = buildAgentGrepTools()
+  const optInTools = buildAgentGrepTools(undefined, { legacyAliases: true })
+
+  test("canonical agentgrep description covers grep/outline/trace and mode=find", () => {
+    const d = tools.agentgrep.description
+    expect(d).toContain("grep")
+    expect(d).toContain("outline")
+    expect(d).toContain("trace")
+    expect(d).toContain("find")
+    expect(d).toMatch(/canonical/i)
+  })
+
+  test("find description is scoped to ranked file discovery only", () => {
+    const d = tools.find.description
+    expect(d).toContain("ranked file discovery")
+    expect(d).toContain("ONLY")
+    expect(d).toContain("agentgrep")
+  })
+
+  test("legacy alias descriptions (opt-in) state compatibility-only / prefer agentgrep", () => {
+    for (const alias of AGENTGREP_ALIASES) {
+      const d = optInTools[alias].description
+      expect(d).toMatch(/compatibilit/i)
+      expect(d).toMatch(/prefer.*agentgrep/i)
+    }
+  })
+})
+
+// ── Local code-search system guidance (idempotent) ───────────────────────────
+
+describe("local code-search system guidance", () => {
+  test("guidance text is scoped to LOCAL repo search and never suggests forbidden tools", () => {
+    const text = agentgrepSystemGuidance()
+    expect(text).toContain(AGENTGREP_GUIDANCE_MARKER)
+    expect(text).toContain("agentgrep")
+    expect(text).toContain("find")
+    expect(text).toMatch(/local repository/i)
+    // Forbidden / compatibility ids must never be RECOMMENDED.
+    expect(text).toMatch(/never call tools\s+named/i)
+    expect(text).toContain("`grep`")
+    expect(text).toContain("`glob`")
+    expect(text).toContain("`Grep`")
+    expect(text).toContain("`file_grep`")
+    // callmux is forbidden only for LOCAL repo search; external tasks are carved out.
+    expect(text).toMatch(/never use callmux or result retrieval for LOCAL repository search/)
+    expect(text).toMatch(/does not apply to external MCP or web tasks/)
+  })
+
+  test("applyAgentGrepSystemGuidance is idempotent", () => {
+    const once = applyAgentGrepSystemGuidance(["base"])
+    expect(once).toHaveLength(2)
+    expect(once[1]).toContain(AGENTGREP_GUIDANCE_MARKER)
+    const twice = applyAgentGrepSystemGuidance(once)
+    expect(twice).toHaveLength(2) // no duplicate append
+    expect(twice).toEqual(once)
+  })
+
+  test("applyAgentGrepSystemGuidance never mutates the input array", () => {
+    const input = ["a", "b"]
+    const out = applyAgentGrepSystemGuidance(input)
+    expect(input).toEqual(["a", "b"])
+    expect(out).not.toBe(input)
   })
 })
 

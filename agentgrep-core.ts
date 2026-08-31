@@ -37,8 +37,15 @@ export {
   resolveAgentGrepToolID,
   normalizeAgentGrepMode,
   normalizeMatchAllGlob,
+  legacyAliasesEnabled,
 } from "./agentgrep-types"
-export type { AgentGrepInput, AgentGrepMode } from "./agentgrep-types"
+export type { AgentGrepInput, AgentGrepMode, AgentGrepRegistryOptions } from "./agentgrep-types"
+
+export {
+  AGENTGREP_GUIDANCE_MARKER,
+  agentgrepSystemGuidance,
+  applyAgentGrepSystemGuidance,
+} from "./agentgrep-guidance"
 
 export {
   buildAgentGrepArgs,
@@ -68,3 +75,87 @@ export {
   AGENTGREP_DEFAULT_TIMEOUT_MS,
 } from "./agentgrep-exec"
 export type { AgentGrepExecOptions, AgentGrepExecResult } from "./agentgrep-exec"
+
+// Harness context adapter (see agentgrep-context.ts for the full contract):
+//   agentgrep-context.ts      — orchestrator (provider factory + precedence)
+//   agentgrep-context-schema.ts — pure shape normalization + bounded ingestion
+//   agentgrep-context-build.ts — harness JSON builder (containment, freshness,
+//                                symbols, dedupe/sort, caps)
+//   agentgrep-context-sdk.ts  — SDK shims, feature detection, bounded pagination
+//   agentgrep-context-sqlite.ts — guarded read-only SQLite fallback
+//   agentgrep-context-temp.ts — secure tempfile lifecycle
+//   agentgrep-context-caps.ts — hard cap constants
+export {
+  createAgentGrepContextProvider,
+} from "./agentgrep-context"
+export type { AgentGrepContextProvider } from "./agentgrep-context"
+
+export {
+  normalizeContextMessages,
+  unwrapResult,
+} from "./agentgrep-context-schema"
+export type {
+  NormalizedContextMessage,
+  NormalizedContextPart,
+  NormalizeResult,
+} from "./agentgrep-context-schema"
+
+export {
+  buildHarnessContext,
+  FreshnessCache,
+  resolveContextRelativePath,
+  serializeHarnessContext,
+  tuneFreshness,
+} from "./agentgrep-context-build"
+export type {
+  HarnessContext,
+  HarnessKnownFile,
+  HarnessKnownRegion,
+  HarnessKnownSymbol,
+} from "./agentgrep-context-build"
+
+export {
+  createV2ClientFromServerUrl,
+  fetchSessionContext,
+  fetchSessionMessages,
+  hasSessionContext,
+  hasSessionMessages,
+  normalizeSdkResult,
+  v1MessagesOf,
+} from "./agentgrep-context-sdk"
+export type {
+  ClientShim,
+  SessionClientShim,
+  V1SessionShim,
+  V2SessionShim,
+  SdkContextResult,
+  SdkFetchError,
+  SdkMessagesResult,
+} from "./agentgrep-context-sdk"
+// Test seam: swap the v2-client factory without touching the network/SDK.
+export { _setV2ClientModule } from "./agentgrep-context-sdk"
+
+export { boundedUtf8Bytes, utf8ByteLength } from "./agentgrep-context-bytes"
+export type { BoundedBytes } from "./agentgrep-context-bytes"
+
+export {
+  CONTEXT_REDACTED_OUTPUT,
+  CONTEXT_TEMP_PLACEHOLDER,
+  hasContextJsonSignature,
+  sanitizeContextOutput,
+} from "./agentgrep-context-sanitize"
+export type { SanitizeOpts, SanitizeResult } from "./agentgrep-context-sanitize"
+
+export {
+  openCodeDbCandidates,
+  sqliteFallbackMessages,
+  validateSqliteCandidate,
+  isValidSessionID,
+  readSessionMessagesFromSqlite,
+} from "./agentgrep-context-sqlite"
+export type { SqliteCandidate, SqliteReadResult } from "./agentgrep-context-sqlite"
+
+export { writeContextTempFile, withContextTempFile } from "./agentgrep-context-temp"
+export type { ContextTempFile } from "./agentgrep-context-temp"
+
+export * from "./agentgrep-context-caps"

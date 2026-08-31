@@ -1,12 +1,20 @@
 # opencode-agentgrep
 
-**v0.1.0** — Standalone OpenCode backend plugin exposing the
+**v0.3.0** — Standalone OpenCode backend plugin exposing the
 [`agentgrep`](https://github.com/1jehuang/agentgrep) CLI (pinned **v0.1.6**) as
-native `Hooks.tool` `ToolDefinition`s: canonical `agentgrep`, legacy aliases
-`file_grep` / `Grep`, and a first-class `find` id (the model-facing replacement
-for the disabled native `glob` tool). It replaces an agent's first noisy burst
-of `rg` + file listing + repeated reads with one compact, structured search
-packet — grep, ranked file discovery, file outlines, and the trace DSL.
+native `Hooks.tool` `ToolDefinition`s: the canonical **`agentgrep`** (exact
+grep, file outlines, relationship traces, plus mode=find for ranked file
+discovery) and the first-class **`find`** shortcut (ranked file discovery
+only). **No `grep`/`glob` ids** (the native tools are disabled by user
+config). The legacy compatibility aliases `file_grep`/`Grep` are registered
+only when `AGENTGREP_LEGACY_ALIASES=1` is set. A **system guidance hook**
+(attached to `experimental.chat.system.transform`) idempotently tells the model
+to use `agentgrep` for local repo code search and never call the unavailable
+native grep/glob or the compatibility aliases; external MCP/web tasks calling
+callmux are untouched. A separate **TUI facade** (`tui.ts`) makes the plugin
+visible in the TUI Plugins screen. The harness context adapter seeds
+trace/smart/outline with a **best-effort current-session harness context**
+(`--context-json`).
 
 No fork patches, no opencode-patches dependency. The plugin is a plain package
 that can be installed from npm or loaded from a local directory via `file://`.
@@ -60,10 +68,16 @@ that can be installed from npm or loaded from a local directory via `file://`.
 ## Requirements
 
 - OpenCode (plugin API) — the plugin pins `@opencode-ai/plugin@1.18.21` for
-  `tool` / `tool.schema` (zod v4 shapes the server registry recognizes).
+  `tool` / `tool.schema` (zod v4 shapes the server registry recognizes) and
+  declares `@opencode-ai/sdk@1.18.21` (for the optional lazy v2 client used by
+  the harness-context adapter).
 - The `agentgrep` v0.1.6 binary (installed by `scripts/install-agentgrep.sh`,
-  or set `AGENTGREP_BIN` to a prebuilt binary). No network is needed at
-  runtime — everything shells out to the local binary.
+  or set `AGENTGREP_BIN` to a prebuilt binary). grep/find/outline/trace always
+  shell out to the local binary with no network; the harness-context adapter
+  additionally makes **guarded SDK calls to the OpenCode server** (the
+  post-compaction `session.context` endpoint and bounded `session.messages`
+  pagination) as a best-effort enhancement — those calls fail closed to
+  "no context" when the server is unreachable.
 
 ## Module layout (IMPORTANT)
 
@@ -74,30 +88,84 @@ plugin function (or a `{ server }` record). A `.ts` plugin whose entrypoint
 also exports constants/helpers therefore fails to load at startup.
 
 - **`index.ts`** — the loader entrypoint. Its **only** export is the default
-  plugin function (`async () => ({ tool })`). Nothing else may be exported
-  from this file.
+  plugin function (`async () => ({ tool, "experimental.chat.system.transform" })`).
+  Nothing else may be exported from this file.
+- **`tui.ts`** — separate **TUI facade** (loaded only from `tui.json`): unique
+  id + `tui()` function, no `server` export; provides a harmless `/agentgrep`
+  status command/toast and shows in the TUI Plugins screen.
 - **`agentgrep-core.ts`** — compatibility **barrel / orchestrator** that
   re-exports every public helper from the focused modules, so tests and
   adapters keep a single import surface. (Not a plugin entrypoint.)
 - **`agentgrep-types.ts`** — contract: tool-id constants, `AgentGrepInput` /
-  `AgentGrepMode`, mode normalization, and match-all glob normalization. Pure.
+  `AgentGrepMode`, registry options (`legacyAliases`), mode normalization, and
+  match-all glob normalization. Pure.
+- **`agentgrep-guidance.ts`** — idempotent LOCAL-only code-search system
+  guidance (marker + text + `applyAgentGrepSystemGuidance`). Pure.
 - **`agentgrep-args.ts`** — exact-file scope translation, find term splitting,
   the pure `buildAgentGrepArgs` argv builder, and the permission operation
   patterns (which MUST match the split argv positionals). Pure.
 - **`agentgrep-tools.ts`** — OpenCode schemas (`tool.schema` zod v4),
   descriptions, the shared execute orchestration (permission asks → canonical
-  roots → argv → bounded spawn), and the registry builder.
+  roots → argv → bounded spawn), and the registry builder (default
+  `agentgrep`+`find`; legacy aliases opt-in).
 - **`agentgrep-paths.ts`** — canonical root resolution, project containment,
   and native-shaped `external_directory` requests.
 - **`agentgrep-exec.ts`** — executable resolution and bounded process
   execution.
-- **`agentgrep.test.ts` / `agentgrep-execute.test.ts`** — the deterministic
-  suite (pure argv/schema + real `ToolDefinition.execute` through a fake CLI
-  harness + permission/traversal/symlink + timeout/output-cap + optional
-  real-CLI smoke).
+- **`agentgrep-context.ts`** — harness-context **orchestrator**: provider
+  factory, precedence (context → messages → SQLite), fail-closed.
+- **`agentgrep-context-schema.ts`** — pure shape normalization + bounded
+  ingestion (`{ info, parts }`, `{ data: [...] }`, arrays, projected v2).
+- **`agentgrep-context-build.ts`** — harness JSON builder: containment,
+  symbols from structured outline/trace lines, freshness/mtime, dedupe/sort,
+  caps.
+- **`agentgrep-context-sdk.ts`** — SDK shims, feature detection, bounded
+  pagination, lazy v2 client from `PluginInput.serverUrl`.
+- **`agentgrep-context-sqlite.ts`** — guarded read-only SQLite fallback
+  (exact-session + directory verification, bounded).
+- **`agentgrep-context-temp.ts`** — secure tempfile lifecycle (0700 dir, 0600
+  `wx` file, cleanup in `finally`).
+- **`agentgrep-context-caps.ts`** — hard cap constants.
+- **`agentgrep-context-bytes.ts`** — bounded UTF-8 byte measurement (byte caps
+  use `Buffer.byteLength`, never `String.length`; deep/cyclic/oversized records
+  are rejected before serialization).
+- **`agentgrep-context-sanitize.ts`** — scrubs the internal `--context-json`
+  temp path / serialized context from ToolResult streams (whole-stream
+  redaction on context-JSON signatures).
+- **`agentgrep.test.ts` / `agentgrep-execute.test.ts` / `agentgrep-context.test.ts` / `agentgrep-tui.test.ts`**
+  — deterministic suites (pure argv/schema; real `ToolDefinition.execute`
+  through a fake CLI harness + permission/traversal/symlink + timeout/output-cap;
+  the focused harness-context suite; TUI facade shape; optional real-CLI smoke).
 - **`scripts/install-agentgrep.sh`** — pinned, idempotent CLI installer.
+- **`scripts/smoke-oc-context.sh`** — end-to-end real-`oc` smoke proving
+  `--context-json` is passed, the context file is valid/0600, it is copied
+  before cleanup, the tempdir is removed, and exact-file containment holds.
+- **`scripts/smoke-oc-selection.sh`** — end-to-end real-`oc` smoke proving the
+  model selects canonical `agentgrep` (never grep/Grep/file_grep/callmux) for
+  local repo search of the regression input `passthroughStream`.
 
 ## Schema & parity (jcode v0.1.6)
+
+### Default model-facing registry
+
+The default registry exposes exactly **two** tool ids:
+
+| Id | Purpose |
+|----|---------|
+| `agentgrep` | Canonical local code-search tool. Accepts all modes: `grep` (exact), `outline` (file structure), `trace` (relationship DSL), and `find` (ranked file discovery). |
+| `find` | Ranked file-discovery shortcut (forces `find` mode; no `mode` arg). |
+
+**Legacy aliases** (`file_grep`, `Grep` — exact case) are registered only when
+`AGENTGREP_LEGACY_ALIASES=1` is set (at startup; the plugin reads the env var).
+They are compatibility-only and should be avoided in new callers.
+
+**`grep` id and `glob` id are deliberately absent** — OpenCode's permission
+gate `tools.grep=false` / `tools.glob=false` filters any tool with those exact
+ids, so a grep/glob-id plugin alias would be unreachable and would silently
+never fire. The native `grep` and `glob` tools are disabled by user config
+(`tools.grep=false`, `tools.glob=false`), not by this plugin.
+
+### Tool schema
 
 The tool schema mirrors **jcode's public `parameters_schema`** exactly. Public
 args on `agentgrep` (key order fixed):
@@ -186,6 +254,11 @@ triggers an unknown-flag clap error (e.g. `outline` + `--type` → clap exit 2).
 - **No shell interpolation.** argv is assembled by the pure
   `buildAgentGrepArgs` and passed to `Bun.spawn` as an array. `mode`, file
   paths, globs and terms can never leak through a shell.
+- **Best-effort session context (`--context-json`), trace/smart/outline only.**
+  Current-session exposures (see "Session harness context" below) seed the
+  planner; the internal temp path is argv-only, the context is fail-closed, and
+  exact-file containment stays exact while context is present. grep/find never
+  receive `--context-json`.
 
 ## Permissions & safety
 
@@ -200,9 +273,9 @@ triggers an unknown-flag clap error (e.g. `outline` + `--type` → clap exit 2).
   denied call never spawns the agentgrep process.
 - The registry intentionally has **no `grep` id and no `glob` id**:
   `tools.grep=false` / `tools.glob=false` filter every tool with those exact
-  ids, so grep/glob-id plugin aliases would be unreachable. `resolveAgentGrepToolID`
-  maps legacy ids (`grep`/`file_grep`/`Grep` → `agentgrep`) for caller-side
-  adapters — it is not a model-facing registry entry.
+  ids, so grep/glob-id plugin aliases would be unreachable. The default registry
+  exposes **`agentgrep` + `find`** only; the legacy compatibility aliases
+  `file_grep`/`Grep` are opt-in via `AGENTGREP_LEGACY_ALIASES=1`.
 
 ## Executable resolution
 
@@ -220,37 +293,199 @@ installer command and the `AGENTGREP_BIN` escape hatch.
 | `AGENTGREP_BIN` | — | Explicit binary path (checked first). |
 | `AGENTGREP_TIMEOUT_MS` | `30000` | Run timeout; the child tree is killed on expiry. |
 | `AGENTGREP_MAX_OUTPUT_CHARS` | `200000` | Per-stream output cap; the child tree is killed on exceed. |
+| `AGENTGREP_CONTEXT_DEBUG` | unset | `1` → harness-context diagnostics on stderr (counts/sources only — never paths, JSON content, or temp paths). |
+| `AGENTGREP_LEGACY_ALIASES` | unset | `1` → also register the legacy compatibility aliases `file_grep` and `Grep` (exact case) on the model-facing registry. |
 | `AGENTGREP_INSTALL_DIR` | `~/.local/bin` | Installer prefix. |
 | `AGENTGREP_BUILD_DIR` / `AGENTGREP_SKIP_BUILD` | — | Installer reuse/idempotence knobs. |
 
-## Known limitation: `context-json` is NOT implemented
+Smoke-script knobs (both `scripts/smoke-oc-context.sh` and
+`scripts/smoke-oc-selection.sh`): `OC_SMOKE_MODEL` (required, skip=exit 2 when
+unset), `OC_SMOKE_TIMEOUT` (default `300`), `OC_SMOKE_TIMEOUT_MS` (CLI run
+timeout for the fake binary), `OC_SMOKE_KEEP_SANDBOX=1` (leave the sandbox for
+inspection).
 
-jcode writes a harness **context JSON** (`--context-json`) for trace/smart and
-outline built from its *session tool-exposure history* (reads, prior agentgrep
-calls, bash file touches, compaction state, file mtimes) to seed the trace
-planner. OpenCode's plugin `ToolContext` has **no honest source for that data**
-— there is no session-message/tool-call history API exposed to plugin tools, so
-any reimplementation would fabricate semantics. This plugin therefore does NOT
-pass `--context-json` and does **not** claim context-json parity with jcode.
+## Local code-search selection guidance (system prompt hook)
 
-**Deliberate follow-up:** if OpenCode exposes a session history API to plugin
-tools, implement the harness context builder (jcode's `context.rs`) against it.
-Until then, trace/outline run without the harness context — the CLI's defaults
-(`--max-files`/`--max-regions`) keep results bounded either way.
+The default plugin attaches an **idempotent** `experimental.chat.system.transform`
+hook that appends a concise, LOCAL-only code-search hint to the system prompt:
+
+- use `agentgrep` for exact search (mode=grep), file outlines (mode=outline),
+  and relationship traces (mode=trace); it can also do ranked discovery with
+  mode=find;
+- use `find` **only** for ranked file discovery;
+- never call tools named `grep`, `glob`, `Grep`, or `file_grep` for local
+  repository search;
+- never use callmux or result retrieval for **local repository** search — the
+  guidance explicitly carves out external MCP/web tasks, where callmux remains
+  available.
+
+The hook appends the guidance text only once (keyed on a stable marker), so
+repeated invocations never duplicate it. It is a hint, not an enforcement
+mechanism — the model still decides which tools to call.
+
+## TUI facade (`tui.ts`)
+
+`tui.ts` is a tiny, separate TUI plugin loaded **only from `tui.json`** (never
+from `plugin` in opencode.json). It:
+
+- carries the mandatory unique id `agentgrep` and a `tui()` function, and has
+  **no `server` export**;
+- makes the plugin visible in the TUI **Plugins screen** (TUI-side load status
+  only — not live server tool availability, which is a server-plugin concern);
+- registers at most a harmless `/agentgrep` slash command that shows a status
+  toast explaining the canonical server tool / config; it never duplicates the
+  server tool and never accesses secrets.
+
+To load it, the **active config** `tui.json` needs an entry for this plugin
+path (the parent adds this after branch/config safety inspection):
+
+```jsonc
+{
+  "tui": ["file:///…/opencode-agentgrep/tui.ts"]
+}
+```
+
+## Session harness context (best-effort `--context-json`)
+
+For **trace / smart / outline** executions (only — never grep/find, matching
+jcode) the plugin now builds a **best-effort harness context JSON** and passes
+it to the CLI as `--context-json`. It is derived **only** from the *current
+session's* explicit message/tool data, is bounded every step of the way, and is
+**fail-closed**: if it cannot produce a trustworthy, in-scope context it simply
+omits the flag (trace/outline still run with the CLI's normal bounded
+defaults). This is **not full jcode parity** — see "Residual gaps" below.
+
+### Precedence
+
+1. **`session.context`** — the v2 post-compaction **active context** endpoint
+   ("all messages after the last compaction"), preferred when available and
+   usable. On the injected v1 client (1.18.21) this method does not exist, so a
+   v2 SDK client is **lazily** created from `PluginInput.serverUrl` in a
+   compatibility-safe way (creation and every call are guarded; a missing/
+   unreachable server or absent dependency is a graceful null).
+2. **`session.messages`** — bounded cursor pagination + shape normalization
+   (v1 `{ info, parts }`, `{ data: [...] }`, plain arrays, projected v2
+   messages).
+3. **Guarded SQLite fallback** — only when both SDK paths yield nothing. The
+   known OpenCode DB is opened read-only (`bun:sqlite` `readonly` + `PRAGMA
+   query_only`), found only at exact known locations
+   (`$OPENCODE_DATA_HOME/opencode.db`, `$XDG_DATA_HOME/opencode/opencode.db`,
+   `~/.local/share/opencode/opencode.db`), realpath/regular-file validated
+   under the corresponding data root (no recursive search). The session must
+   match a conservative id whitelist, its canonical `directory` must match
+   `ctx.directory`/`ctx.worktree`, and only `session`/`message`/`part` rows for
+   the **current** session are read, always with parameterized
+   `WHERE session_id = ?`, with bounded rows/bytes. Every error is caught and
+   the DB is always closed.
+
+### What the context contains (and only that)
+
+Paths are surfaced **only** from explicit known shapes and validated by
+canonical containment within the search root (symlinks resolved); outside paths
+are dropped and safe **relative** paths are serialized:
+
+- assistant `snapshot.files` (v2);
+- local user file attachments represented as filesystem / `file://` paths;
+- completed tool inputs for `read` (explicit `file_path` + range),
+  `agentgrep`/`grep`/`file_grep`/`Grep` (explicit `file`/`file_path` for
+  outline, `path` for trace/smart), `find`/`glob` (explicit `path`), and v2
+  explicit `outputPaths`;
+- symbols parsed only from AgentGrep **outline/trace structured result lines**
+  (bounded/truncated);
+- mtime/freshness reasons from **bounded** stat calls, and
+  active-context/recent/older/**compacted** markers only when the data actually
+  supports them.
+
+**Never** copied into context: freeform prompts, credentials, environment,
+arbitrary DB contents, or arbitrary tool output text.
+
+### Privacy, boundaries & safety
+
+- **Current-session only.** The adapter uses exactly `ctx.sessionID`; any
+  record **or part** (v1 parts, v2 user files / tool content / snapshots) that
+  *explicitly* declares another session is skipped before any path extraction.
+  The SQLite fallback additionally verifies the session directory.
+- **Fail-closed.** Malformed / missing / throwing / oversized / out-of-session
+  inputs degrade to **no context** (null). Every hard cap is exported as a
+  testable constant in `agentgrep-context-caps.ts` (pages, messages/parts,
+  source bytes, JSON bytes, unique paths, known files/regions/symbols, focus
+  files, line ranges, string lengths, SQL rows/bytes, stat calls). Caps named
+  in **bytes** are measured as UTF-8 (`Buffer.byteLength`), never
+  `String.length`; caps are enforced **early and globally** (before mapping/
+  serializing/scanning beyond the bound, including across all message parts).
+  Dedupe and sort are deterministic.
+- **Secure tempfile + output sanitization.** The context JSON is written to a
+  0700 temp dir (`mkdtemp` under `os.tmpdir()`), file opened `wx` (exclusive)
+  mode 0600, byte capped before creation; the internal path is passed **only**
+  as `--context-json` argv (never in permission asks, `ToolResult`, metadata,
+  or logs), and the whole temp dir is removed in a `finally` on success, error,
+  nonzero exit, timeout, and abort. Every stream returned by execute is
+  scrubbed while a context file is active: a child that echoes the exact
+  context JSON (or its `known_files`/`known_regions`/`known_symbols`/
+  `focus_files` + `version:1` signature) is redacted whole, and an exact temp
+  path is replaced with `[context-json]`. With no usable context the behavior
+  is byte-for-byte unchanged.
+
+### Residual gaps (honest, not full parity)
+
+- **Preferred `session.context` is a best-effort path**; on 1.18.21 the
+  injected v1 client lacks it and the lazily-created v2 client has no auth
+  headers, so in practice the **messages path or the SQLite fallback** usually
+  supplies the data.
+- **No bash/shell exposure parsing** (jcode parses `cat`/`sed`/`git`/output
+  hits; we deliberately do not touch freeform shell commands).
+- **Compaction framing** is approximated from visible compaction markers /
+  the active-context source, not from OpenCode's internal compaction state.
+- **Confidence values** reuse jcode's profiles/reasons where the source
+  matches; genuinely new sources use their own explicit reason strings and
+  modest confidences. We do not claim jcode's exact tuning.
+- This covers the documented best-effort **subset**, not jcode's full
+  `context.rs` behavior.
 
 ## Development
 
 ```bash
-bun install        # fetches @opencode-ai/plugin@1.18.21 (+ devDeps)
-bun test           # deterministic suite + real-CLI smoke when a binary is present
+bun install        # fetches @opencode-ai/plugin@1.18.21 + @opencode-ai/sdk + devDeps
+bun test           # deterministic suites + real-CLI smoke when a binary is present
+bun test agentgrep-context.test.ts   # focused harness-context suite
 bunx tsc --noEmit  # strict typecheck over entry, sources and tests
 bash -n scripts/install-agentgrep.sh
+bash -n scripts/smoke-oc-context.sh
+bash -n scripts/smoke-oc-selection.sh
 ```
 
 The real-CLI smoke tests run automatically when `~/.local/bin/agentgrep` (or
 `AGENTGREP_BIN`) exists, and are skipped otherwise — they use only local temp
 workspaces and never touch the network. The deterministic suite runs a fake
 CLI harness so it passes without a binary.
+
+**End-to-end context smoke** (real `oc run`, requires a model):
+
+```bash
+OC_SMOKE_MODEL=provider/model bash scripts/smoke-oc-context.sh
+```
+
+**End-to-end selection smoke** (real `oc run`, requires a model):
+
+```bash
+OC_SMOKE_MODEL=provider/model bash scripts/smoke-oc-selection.sh
+```
+
+The selection smoke proves the model selects the canonical `agentgrep` tool
+(never bare `grep`/`glob`/`Grep`/`file_grep`/`callmux`) for local repository
+code search, using the regression input `passthroughStream`. It uses a
+controlled fake agentgrep binary and captures `--format json` events to assert
+tool selection. Exits 2 (SKIP) when `OC_SMOKE_MODEL` is unset, 0 on pass, 1 on
+failure. No secrets are printed and no temp files are left behind.
+
+**The context smoke is NOT hermetic by design.** It runs a real `oc run` against the
+ACTIVE OpenCode config and reads the existing provider/credential
+configuration **read-only** (it injects only the plugin + permissions via
+`OPENCODE_CONFIG_CONTENT`/`OPENCODE_PERMISSION` and never mutates config
+files). It creates a throwaway session in the normal OpenCode data store, which
+is the inherent cost of a real `oc run`. The selection smoke follows the same
+pattern. Diagnostics (recorded argv, log tail, events) have the real sandbox
+path redacted.
 
 ## License
 

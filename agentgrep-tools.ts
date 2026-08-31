@@ -1,7 +1,7 @@
 // agentgrep-tools — the OpenCode-facing half of the standalone agentgrep
 // plugin: tool descriptions, the shared execute orchestration (permission
-// asks → canonical roots → argv → bounded spawn), and the tool registry
-// builder using the canonical `tool({...})` factory.
+// asks → canonical roots → harness context → argv → bounded spawn), and the
+// tool registry builder using the canonical `tool({...})` factory.
 //
 // Module split of the former monolithic agentgrep-core.ts:
 //   agentgrep-types.ts  — contract/types + mode/term/glob normalization
@@ -12,26 +12,38 @@
 //   agentgrep-core.ts   — compatibility barrel
 //   agentgrep-paths.ts  — canonical roots, containment, external asks
 //   agentgrep-exec.ts   — binary resolution + bounded execution
+//   agentgrep-context*  — harness context adapter (see agentgrep-context.ts)
 //
 // ⚠️ This module is NOT a plugin entrypoint. Only index.ts may be loaded by
 // OpenCode, and it must export exactly one thing (the default plugin fn).
 
-import { tool, type ToolDefinition, type ToolContext, type ToolResult } from "@opencode-ai/plugin"
+import { tool, type PluginInput, type ToolDefinition, type ToolContext, type ToolResult } from "@opencode-ai/plugin"
 import path from "node:path"
 import type { AgentGrepInput, AgentGrepMode } from "./agentgrep-types"
-import { AGENTGREP_CANONICAL_ID, AGENTGREP_FIND_ID, normalizeAgentGrepMode } from "./agentgrep-types"
+import {
+  AGENTGREP_CANONICAL_ID,
+  AGENTGREP_FIND_ID,
+  legacyAliasesEnabled,
+  normalizeAgentGrepMode,
+  type AgentGrepRegistryOptions,
+} from "./agentgrep-types"
 import { buildAgentGrepArgs, exactFileScope, operationPatterns } from "./agentgrep-args"
 import { askExternalDirectoryIfNeeded, canonicalizePath, resolveModelRoots } from "./agentgrep-paths"
 import { resolveAgentGrepBin, runAgentGrep } from "./agentgrep-exec"
+import { createAgentGrepContextProvider, type AgentGrepContextProvider } from "./agentgrep-context"
+import { writeContextTempFile, type ContextTempFile } from "./agentgrep-context-temp"
+import { sanitizeContextOutput, type SanitizeResult } from "./agentgrep-context-sanitize"
 
 function toolDescription(alias: string | null): string {
   const header =
-    `Code search and retrieval over a repository using the agentgrep CLI (v0.1.6). ` +
-    `One-shot, lexical-first, returns a compact investigation-ready result packet.`
+    `Canonical code search and retrieval tool over the current repository using the ` +
+    `agentgrep CLI (v0.1.6). One-shot, lexical-first, returns a compact investigation-` +
+    `ready result packet. Use this tool for exact search, file outlines, and traces.`
   const modes =
-    `Modes: "grep" (exact search), "find" (ranked file discovery), ` +
-    `"outline" (structure scan of a known file, requires \`file\`), ` +
-    `"trace" (structured investigation with ranked files+regions).`
+    `Modes: "grep" (exact search), "outline" (structure scan of a known file, ` +
+    `requires \`file\`), "trace" (structured investigation with ranked files+regions). ` +
+    `It can also do ranked file discovery with mode="find", but the dedicated \`find\` ` +
+    `tool is the preferred shortcut for that.`
   const schema =
     `Args follow the jcode-compatible public schema: \`query\`, \`file\`, \`terms\`, ` +
     `\`regex\`, \`path\`, \`glob\`, \`type\`, \`max_files\`, \`max_regions\`, \`paths_only\`. ` +
@@ -42,17 +54,19 @@ function toolDescription(alias: string | null): string {
     `output is capped (default 200000 chars) and runs are killed after a default 30s timeout.`
   const note =
     alias === "file_grep" || alias === "Grep"
-      ? ` Legacy alias for the canonical \`agentgrep\` tool.`
+      ? ` Compatibility-only legacy alias for the canonical \`agentgrep\` tool. Prefer \`agentgrep\`.`
       : ""
   return [header, modes, schema, note.split("\n").join(" ")].filter(Boolean).join("\n\n")
 }
 
 function findToolDescription(): string {
   return (
-    `File discovery over a repository using the agentgrep CLI (v0.1.6) \`find\` mode. ` +
-    `Returns ranked candidate files matching the given terms, optionally narrowed by ` +
-    `\`glob\` / \`type\` / \`max_files\`. This is the model-facing replacement for the ` +
-    `disabled native \`glob\` tool — use it for "find the file that..." questions. ` +
+    `Ranked file discovery over the current repository using the agentgrep CLI (v0.1.6) ` +
+    `\`find\` mode. Use this tool ONLY for ranked file discovery ("find the file that..."). ` +
+    `For exact search, file outlines, or traces use the canonical \`agentgrep\` tool instead ` +
+    `(agentgrep can also do ranked discovery with mode=find). Results are ranked candidate ` +
+    `files matching the given terms, optionally narrowed by \`glob\` / \`type\` / \`max_files\`. ` +
+    `This is the model-facing replacement for the disabled native \`glob\` tool. ` +
     `A file-valued \`path\` scopes discovery to that exact file. \`path\` defaults to ` +
     `the current project directory; relative paths resolve against it. Paths outside ` +
     `the project require external_directory permission. Results are bounded CLI-side ` +
@@ -70,22 +84,36 @@ function findToolDescription(): string {
  *      canonical glob + metadata, deduped).
  * Denials reject execute (they are NOT converted to tool results), so a denied
  * call can never spawn the agentgrep process.
+ *
+ * Harness context (trace/smart/outline only): built AFTER permission asks so a
+ * denied call never triggers SDK/SQLite/stat work, and its failures degrade to
+ * "no context" (never affect permission, path, argv, or search behavior). The
+ * context tempfile is removed in a `finally` on success/nonzero/timeout/abort/
+ * error, and its path never leaks into asks, results, or metadata.
+ *
+ * NOTE (hidden-smart parity): `input.mode` is threaded through RAW into the
+ * args builder so `smart` + multiword `query` still splits into trace DSL terms
+ * inside buildAgentGrepArgs/operationPatterns, while the CLI subcommand is
+ * resolved to `trace`. `resolvedMode` (smart → trace) is used only for
+ * metadata and find-forcing; it does NOT overwrite the raw mode.
  */
 async function executeAgentGrep(
   input: Record<string, any>,
   ctx: ToolContext,
-  mode: AgentGrepMode,
+  resolvedMode: AgentGrepMode,
+  provider: AgentGrepContextProvider,
+  forceMode?: AgentGrepMode,
 ): Promise<ToolResult> {
-  const title = `agentgrep ${mode}`
-  const roots = resolveModelRoots(input, mode, ctx.directory)
-  const patterns = operationPatterns(mode, input)
+  const title = `agentgrep ${resolvedMode}`
+  const roots = resolveModelRoots(input, resolvedMode, ctx.directory)
+  const patterns = operationPatterns(resolvedMode, input)
 
   await ctx.ask({
     permission: "agentgrep",
     patterns,
     always: ["*"],
     metadata: {
-      mode,
+      mode: resolvedMode,
       pattern: patterns.join(" ") || undefined,
       path: roots.path?.full ?? ctx.directory,
       include: input.glob ?? input.include,
@@ -93,30 +121,65 @@ async function executeAgentGrep(
   })
   await askExternalDirectoryIfNeeded(ctx, roots)
 
-  let argv: string[]
+  let normalized: AgentGrepInput
+  let contextTemp: ContextTempFile | null = null
+  let contextJson: string | null = null
+  // While a context file is active, every stream returned by execute must be
+  // scrubbed of the temp path / serialized context before it reaches the model.
+  const sanitize = (text: string): SanitizeResult =>
+    sanitizeContextOutput(text, { tempPath: contextTemp?.path ?? null, contextJson })
   try {
-    // Pin the resolved mode so forced-mode tools (the `find` id) cannot fall
-    // back to buildAgentGrepArgs' grep default. Thread canonical roots back
-    // into the pure args builder (exact-file scopes via __fileScope).
-    const normalized: AgentGrepInput = { ...input, mode }
+    // Keep the RAW caller mode so smart query-splitting survives into the args
+    // builder; only a forced-mode tool (the `find` id) pins the mode here.
+    normalized = { ...input }
+    if (forceMode) normalized.mode = forceMode
+
     if (roots.path?.isExactFile) {
-      // Exact-file scope: only a canonical path that is an EXISTING file is
-      // translated (jcode is_file()); nonexistent leaves stay directory roots.
       const scope = exactFileScope(roots.path.full, roots.path.kind)
       if (scope) normalized.__fileScope = scope
     } else if (roots.path) {
       normalized.path = roots.path.full
     }
-    if (mode === "outline") {
+    if (resolvedMode === "outline") {
       if (roots.outline) normalized.file = roots.outline.full
       if (!roots.path) normalized.path = canonicalizePath(path.resolve(ctx.directory, "."))
     }
-    argv = buildAgentGrepArgs(normalized)
+
+    // Harness context for trace/smart/outline only (jcode parity). Guarded so
+    // failures here never affect the tool's other behavior. The search root for
+    // context is always a DIRECTORY (the project root / directory-valued path
+    // root) — never an exact-file leaf — because context paths serialize
+    // relative to the repository root and must be contained within it.
+    if (resolvedMode === "trace" || resolvedMode === "outline") {
+      const searchRoot =
+        roots.path && roots.path.kind === "directory"
+          ? roots.path.full
+          : canonicalizePath(path.resolve(ctx.directory, "."))
+      const json = await provider.getHarnessJson(input, ctx, searchRoot)
+      contextJson = json
+      contextTemp = writeContextTempFile(json)
+      if (contextTemp) normalized.__contextJson = contextTemp.path
+    }
   } catch (err) {
+    contextTemp?.cleanup()
+    const safe = sanitize((err as Error)?.message ?? String(err))
     return {
       title,
-      output: `agentgrep: invalid arguments: ${(err as Error).message}`,
-      metadata: { mode, ok: false },
+      output: `agentgrep: invalid arguments: ${safe.text}`,
+      metadata: { mode: resolvedMode, ok: false, contextRedacted: safe.redacted || undefined },
+    }
+  }
+
+  let argv: string[]
+  try {
+    argv = buildAgentGrepArgs(normalized)
+  } catch (err) {
+    contextTemp?.cleanup()
+    const safe = sanitize((err as Error)?.message ?? String(err))
+    return {
+      title,
+      output: `agentgrep: invalid arguments: ${safe.text}`,
+      metadata: { mode: resolvedMode, ok: false, contextRedacted: safe.redacted || undefined },
     }
   }
 
@@ -124,10 +187,12 @@ async function executeAgentGrep(
   try {
     bin = resolveAgentGrepBin()
   } catch (err) {
+    contextTemp?.cleanup()
+    const safe = sanitize((err as Error)?.message ?? String(err))
     return {
       title,
-      output: `agentgrep executable unavailable.\n\n${(err as Error).message}`,
-      metadata: { mode, ok: false },
+      output: `agentgrep executable unavailable.\n\n${safe.text}`,
+      metadata: { mode: resolvedMode, ok: false, contextRedacted: safe.redacted || undefined },
     }
   }
 
@@ -137,57 +202,65 @@ async function executeAgentGrep(
       cwd: ctx.directory,
       signal: ctx.abort,
     })
+    const stdout = sanitize(result.stdout)
+    const stderr = sanitize(result.stderr)
     if (result.timedOut) {
       return {
         title,
         output:
-          `agentgrep (${mode}) timed out and was killed. ` +
+          `agentgrep (${resolvedMode}) timed out and was killed. ` +
           `Narrow the query or raise AGENTGREP_TIMEOUT_MS.`,
-        metadata: { mode, ok: false, timedOut: true, exit: result.exit, bin },
+        metadata: { mode: resolvedMode, ok: false, timedOut: true, exit: result.exit, bin },
       }
     }
     if (result.aborted) {
       return {
         title,
         output: `agentgrep: aborted.`,
-        metadata: { mode, ok: false, aborted: true, exit: result.exit },
+        metadata: { mode: resolvedMode, ok: false, aborted: true, exit: result.exit },
       }
     }
     if (result.exit !== 0) {
-      const detail = (result.stderr || result.stdout).trim() || `exit ${result.exit}`
+      const detail = (stderr.text || stdout.text).trim() || `exit ${result.exit}`
       return {
         title,
-        output: `agentgrep (${mode}) failed (exit ${result.exit}):\n${detail}`,
+        output: `agentgrep (${resolvedMode}) failed (exit ${result.exit}):\n${detail}`,
         metadata: {
-          mode,
+          mode: resolvedMode,
           ok: false,
           exit: result.exit,
           bin,
           truncated: result.truncated || undefined,
+          contextRedacted: stdout.redacted || stderr.redacted || undefined,
         },
       }
     }
     return {
       title,
-      output: result.stdout,
+      output: stdout.text,
       metadata: {
-        mode,
+        mode: resolvedMode,
         ok: true,
         exit: result.exit,
         bin,
         truncated: result.truncated || undefined,
         boundKilled: result.boundKilled,
+        contextRedacted: stdout.redacted || stderr.redacted || undefined,
       },
     }
   } catch (err) {
     const aborted = (ctx.abort && ctx.abort.aborted) || (err as Error)?.name === "AbortError"
+    const safe = sanitize((err as Error)?.message ?? String(err))
     return {
       title,
       output: aborted
         ? "agentgrep: aborted."
-        : `agentgrep: execution error: ${(err as Error)?.message ?? String(err)}`,
-      metadata: { mode, ok: false, aborted: aborted || undefined },
+        : `agentgrep: execution error: ${safe.text}`,
+      metadata: { mode: resolvedMode, ok: false, aborted: aborted || undefined, contextRedacted: safe.redacted || undefined },
     }
+  } finally {
+    // Success, nonzero, timeout, abort, and thrown errors all clean up.
+    contextTemp?.cleanup()
   }
 }
 
@@ -196,16 +269,8 @@ async function executeAgentGrep(
  * from `@opencode-ai/plugin`. The args shape uses `tool.schema` (the plugin
  * package's own zod — v4) so the server's registry recognizes the types and can
  * serialize a proper JSON Schema for /experimental/tool.
- *
- * The schema is the JCODE-COMPATIBLE PUBLIC surface only, in key order:
- * mode, query, file, terms, regex, path, glob, type, max_files, max_regions,
- * paths_only. It uses `type` (NOT file_type), the public enum
- * grep|find|outline|trace (no smart), and exposes no hidden/no_ignore/
- * full_region/debug_* fields. jcode-internal aliases (pattern, file_path,
- * include, ...) are still accepted at runtime by the execute layer but are
- * never advertised to the model.
  */
-function buildTool(alias: string | null): ToolDefinition {
+function buildTool(alias: string | null, provider: AgentGrepContextProvider): ToolDefinition {
   return tool({
     description: toolDescription(alias),
     args: {
@@ -257,19 +322,19 @@ function buildTool(alias: string | null): ToolDefinition {
         .describe("Return only matching paths instead of match excerpts where supported."),
     },
     execute: async (input: Record<string, any>, ctx: ToolContext): Promise<ToolResult> => {
-      const mode = normalizeAgentGrepMode(input.mode)
-      return executeAgentGrep(input, ctx, mode)
+      // Validate + resolve (smart → trace) for metadata, but keep the RAW mode
+      // inside executeAgentGrep so smart query-splitting works.
+      const resolvedMode = normalizeAgentGrepMode(input.mode)
+      return executeAgentGrep(input, ctx, resolvedMode, provider)
     },
   })
 }
 
 /**
  * The first-class `find` id: forces agentgrep `find` mode regardless of any
- * `mode` the model passes. This is the model-facing replacement for the
- * disabled native `glob` tool (glob is intentionally NOT registered — the
- * `glob` id is permission-filtered the same way `grep` is).
+ * `mode` the model passes.
  */
-function buildFindTool(): ToolDefinition {
+function buildFindTool(provider: AgentGrepContextProvider): ToolDefinition {
   return tool({
     description: findToolDescription(),
     args: {
@@ -307,24 +372,41 @@ function buildFindTool(): ToolDefinition {
         .describe("Return only matching paths instead of match excerpts where supported."),
     },
     execute: async (input: Record<string, any>, ctx: ToolContext): Promise<ToolResult> => {
-      return executeAgentGrep(input, ctx, "find")
+      return executeAgentGrep(input, ctx, "find", provider, "find")
     },
   })
 }
 
 /**
- * Build the registry of tool definitions. Canonical `agentgrep`, the two
- * legacy aliases, and the first-class `find` id (forced find mode). NOTE:
- * intentionally NO `grep` id and NO `glob` id — the permission gate
- * `tools.grep=false` / `tools.glob=false` filters any tool with those ids, so
- * grep/glob-id plugin aliases would be unreachable and would silently never
- * fire.
+ * Build the registry of tool definitions.
+ *
+ * Default: canonical `agentgrep` (mode-flexible, the primary local code-search
+ * tool) and the first-class `find` id (forced find mode, the ranked file-
+ * discovery shortcut). Legacy compatibility aliases `file_grep`/`Grep` are
+ * registered ONLY when `opts.legacyAliases === true` (or the env var
+ * `AGENTGREP_LEGACY_ALIASES=1` is set). NOTE: intentionally NO `grep` id and
+ * NO `glob` id — the permission gate `tools.grep=false` / `tools.glob=false`
+ * filters any tool with those ids, so grep/glob-id plugin aliases would be
+ * unreachable and would silently never fire.
+ *
+ * `pluginInput` is threaded from the loader so the shared harness context
+ * adapter can feature-detect the injected SDK client and (lazily) a v2 client
+ * from `PluginInput.serverUrl`. Backwards-compatible: omitted → a provider
+ * with no SDK client (context then only ever falls through to a best-effort
+ * SQLite probe, which in practice yields null).
  */
-export function buildAgentGrepTools(): Record<string, ToolDefinition> {
-  return {
-    [AGENTGREP_CANONICAL_ID]: buildTool(null),
-    ["file_grep"]: buildTool("file_grep"),
-    ["Grep"]: buildTool("Grep"),
-    [AGENTGREP_FIND_ID]: buildFindTool(),
+export function buildAgentGrepTools(
+  pluginInput?: PluginInput,
+  opts?: AgentGrepRegistryOptions,
+): Record<string, ToolDefinition> {
+  const provider = createAgentGrepContextProvider(pluginInput)
+  const tools: Record<string, ToolDefinition> = {
+    [AGENTGREP_CANONICAL_ID]: buildTool(null, provider),
+    [AGENTGREP_FIND_ID]: buildFindTool(provider),
   }
+  if (legacyAliasesEnabled(opts)) {
+    tools["file_grep"] = buildTool("file_grep", provider)
+    tools["Grep"] = buildTool("Grep", provider)
+  }
+  return tools
 }

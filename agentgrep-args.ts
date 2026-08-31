@@ -163,6 +163,13 @@ export function buildAgentGrepArgs(input: AgentGrepInput): string[] {
   if (glob && mode !== "outline") args.push("--glob", glob)
   if (rootPath) args.push("--path", rootPath)
 
+  // JCODE parity: the harness context JSON is only accepted by trace (incl.
+  // its `smart` alias) and outline subcommands — never grep/find. The path is
+  // purely internal; it can never influence the permission or path flows.
+  if (input.__contextJson && (mode === "trace" || mode === "outline")) {
+    args.push("--context-json", input.__contextJson)
+  }
+
   return args
 }
 
