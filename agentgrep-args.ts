@@ -24,10 +24,26 @@ import type { AgentGrepInput, AgentGrepMode } from "./agentgrep-types"
 import { normalizeAgentGrepMode, normalizeMatchAllGlob } from "./agentgrep-types"
 
 /**
+ * Escape glob metacharacters so a basename is matched LITERALLY by the
+ * AgentGrep v0.1.6 CLI's globset-backed `--glob` (proven against v0.1.6:
+ * `a\*.ts` matches only `a*.ts`, `a\[1\].ts` only `a[1].ts`, `a\{b\}.ts`
+ * only `a{b}.ts`, `a\\b.ts` only `a\b.ts`). `\` is the globset escape char;
+ * every metachar that could over-match a sibling is escaped.
+ */
+export function globEscape(basename: string): string {
+  return basename.replace(/[\\*?[\]{}]/g, (c) => `\\${c}`)
+}
+
+/**
  * Translate an exact-file root into a CLI-safe scope: search the canonical
  * parent directory restricted to the file's basename (jcode
  * resolved_search_scope). A directory root is never translated. The user glob
  * is deliberately ignored for file scopes — the exact file wins (jcode parity).
+ *
+ * The basename is glob-escaped so the emitted `--glob` matches ONLY the literal
+ * file, never a sibling whose name happens to match a wildcard (e.g. `a*.ts`
+ * must not match `a1.ts`, `a[1].ts` must not match `a1.ts`, `a\b.ts` must not
+ * match `ab.ts`).
  */
 export function exactFileScope(
   full: string,
@@ -35,7 +51,7 @@ export function exactFileScope(
   _userGlob?: string,
 ): { root: string; glob: string } | null {
   if (kind !== "file") return null
-  return { root: path.dirname(full), glob: path.basename(full) }
+  return { root: path.dirname(full), glob: globEscape(path.basename(full)) }
 }
 
 /**
@@ -55,6 +71,34 @@ export function findSplitTerms(input: AgentGrepInput): string[] {
   return []
 }
 
+/** Names that begin with `-` and must never reach the CLI unquoted. */
+function hasLeadingDash(value: string | undefined | null): boolean {
+  return value !== undefined && value !== null && value.startsWith("-") && value.trim() !== ""
+}
+
+/** Internal `type` normalization: public `type` (schema key) wins over file_type. */
+function normalizeFileType(input: AgentGrepInput): string | undefined {
+  if (typeof input.type === "string") return input.type
+  return input.file_type
+}
+
+/**
+ * Reject a named-option VALUE that starts with `-`. AgentGrep v0.1.6 (clap)
+ * cannot accept hyphen-leading values for named options (`--type -rs` and
+ * `--glob --foo` both fail with "unexpected argument", and the `--` tip only
+ * applies to positionals — proven against v0.1.6). Such a value can never be a
+ * legitimate ripgrep file type or glob filter, so it is rejected with a clear
+ * no-spawn error rather than risking argv misinterpretation.
+ */
+function assertNamedValueSafe(value: string | undefined, field: string): void {
+  if (hasLeadingDash(value)) {
+    throw new Error(
+      `${field} value ${JSON.stringify(value)} starts with "-" and cannot be passed safely to the ` +
+        `agentgrep CLI (v0.1.6 named options reject hyphen-leading values). Remove the leading dash.`,
+    )
+  }
+}
+
 /**
  * Does this find call carry a real narrowing scope (path, file, type, or a
  * normalized non-match-all glob)? Mirrors jcode's find requirement check: a
@@ -63,7 +107,7 @@ export function findSplitTerms(input: AgentGrepInput): string[] {
 function findHasNarrowingScope(input: AgentGrepInput): boolean {
   const pathVal = input.path ? String(input.path).trim() : ""
   const fileVal = input.file ?? input.file_path
-  const typeVal = input.file_type ? String(input.file_type).trim() : ""
+  const typeVal = normalizeFileType(input)?.trim() ?? ""
   if (pathVal !== "" || (fileVal && String(fileVal).trim() !== "") || typeVal !== "") return true
   return normalizeMatchAllGlob(input.glob ?? input.include) !== undefined
 }
@@ -91,11 +135,21 @@ const TRACE_DEFAULT_MAX_REGIONS = 6
  * subcommand) safe for Bun.spawn — no shell interpolation ever. Flags are
  * emitted ONLY for modes the AgentGrep CLI accepts them in (see the per-mode
  * table in the README), so argv never triggers an unknown-flag clap error.
+ *
+ * Leading-dash safety (proven against AgentGrep v0.1.6):
+ *   - Named-option VALUES (`type`, `glob`) that start with `-` are REJECTED
+ *     with a clear error — v0.1.6 cannot take hyphen-leading named-option
+ *     values and the `--` tip only applies to positionals.
+ *   - POSITIONAL values (`query`/`pattern`, find `terms`, outline
+ *     `file`/`file_path`, trace `terms`) that start with `-` use the clap
+ *     end-of-options marker `--`: v0.1.6 supports `--` after the subcommand
+ *     for grep/find/outline/trace. When a `--` is required, ALL flags are
+ *     emitted before it and the positionals after it (everything after `--`
+ *     is positional, so the flags must precede it).
  */
 export function buildAgentGrepArgs(input: AgentGrepInput): string[] {
   const rawMode = input.mode
   const mode = normalizeAgentGrepMode(rawMode)
-  const args: string[] = [mode]
 
   // An exact-file scope (set by the execute path) replaces path + glob: the
   // search must hit only that canonical file, never a sibling.
@@ -103,12 +157,22 @@ export function buildAgentGrepArgs(input: AgentGrepInput): string[] {
   const rootPath = fileScope ? fileScope.root : input.path
   const glob = fileScope ? fileScope.glob : normalizeMatchAllGlob(input.glob ?? input.include)
 
+  // Reject hyphen-leading named-option values that v0.1.6 cannot accept —
+  // only where the flag is actually emitted (outline drops type/glob).
+  if (mode !== "outline") {
+    assertNamedValueSafe(normalizeFileType(input), "type")
+    if (!fileScope) assertNamedValueSafe(input.glob ?? input.include, "glob")
+  }
+
+  const positionals: string[] = []
+  const flags: string[] = []
+
   switch (mode) {
     case "grep": {
       const query = input.query ?? input.pattern
       if (!query || String(query).trim() === "") throw new Error("grep mode requires `query` (alias `pattern`)")
-      args.push(String(query).trim())
-      if (input.regex) args.push("--regex")
+      positionals.push(String(query).trim())
+      if (input.regex) flags.push("--regex")
       break
     }
     case "find": {
@@ -120,56 +184,65 @@ export function buildAgentGrepArgs(input: AgentGrepInput): string[] {
         // The CLI requires ≥1 positional QUERY_PARTS; jcode allows empty
         // query_parts when a scope narrows the search. An empty-string
         // positional bridges the two so glob-only/type-only/path-only finds run.
-        args.push("")
+        positionals.push("")
       } else {
-        args.push(...terms)
+        positionals.push(...terms)
       }
       break
     }
     case "outline": {
       const file = input.file ?? input.file_path
       if (!file) throw new Error("outline mode requires `file` (alias `file_path`)")
-      args.push(String(file))
+      positionals.push(String(file))
       break
     }
     case "trace": {
-      args.push(...traceTerms(input))
+      positionals.push(...traceTerms(input))
       break
     }
   }
 
   // Mode-specific option block (only where the CLI accepts the flag):
   //   outline: --max-items            trace: --max-regions, --full-region
-  if (mode === "outline" && input.max_items !== undefined) args.push("--max-items", String(input.max_items))
+  if (mode === "outline" && input.max_items !== undefined) flags.push("--max-items", String(input.max_items))
   if (mode === "trace") {
     const maxRegions = input.max_regions ?? TRACE_DEFAULT_MAX_REGIONS
-    args.push("--max-regions", String(maxRegions))
+    flags.push("--max-regions", String(maxRegions))
   }
-  if (mode === "trace" && input.full_region) args.push("--full-region", input.full_region)
+  if (mode === "trace" && input.full_region) flags.push("--full-region", input.full_region)
 
   // Shared options (grep/find/trace; outline accepts none of these).
-  if (input.file_type && mode !== "outline") args.push("--type", input.file_type)
+  const fileType = normalizeFileType(input)
+  if (fileType && mode !== "outline") flags.push("--type", fileType)
   if (mode === "find" || mode === "trace") {
     const maxFiles =
       input.max_files ??
       (mode === "find" ? FIND_DEFAULT_MAX_FILES : TRACE_DEFAULT_MAX_FILES)
-    args.push("--max-files", String(maxFiles))
+    flags.push("--max-files", String(maxFiles))
   }
-  if (input.paths_only && mode !== "outline") args.push("--paths-only")
-  if (input.hidden && mode !== "outline") args.push("--hidden")
-  if (input.no_ignore && mode !== "outline") args.push("--no-ignore")
-  if (mode === "trace" && input.debug_plan) args.push("--debug-plan")
-  if ((mode === "find" || mode === "trace") && input.debug_score) args.push("--debug-score")
-  if (glob && mode !== "outline") args.push("--glob", glob)
-  if (rootPath) args.push("--path", rootPath)
+  if (input.paths_only && mode !== "outline") flags.push("--paths-only")
+  if (input.hidden && mode !== "outline") flags.push("--hidden")
+  if (input.no_ignore && mode !== "outline") flags.push("--no-ignore")
+  if (mode === "trace" && input.debug_plan) flags.push("--debug-plan")
+  if ((mode === "find" || mode === "trace") && input.debug_score) flags.push("--debug-score")
+  if (glob && mode !== "outline") flags.push("--glob", glob)
+  if (rootPath) flags.push("--path", rootPath)
 
   // JCODE parity: the harness context JSON is only accepted by trace (incl.
   // its `smart` alias) and outline subcommands — never grep/find. The path is
   // purely internal; it can never influence the permission or path flows.
   if (input.__contextJson && (mode === "trace" || mode === "outline")) {
-    args.push("--context-json", input.__contextJson)
+    flags.push("--context-json", input.__contextJson)
   }
 
+  const args: string[] = [mode]
+  if (positionals.some(hasLeadingDash)) {
+    // End-of-options marker: flags first, `--`, then the positionals. Proven
+    // for grep/find/outline/trace on AgentGrep v0.1.6.
+    args.push(...flags, "--", ...positionals)
+  } else {
+    args.push(...positionals, ...flags)
+  }
   return args
 }
 

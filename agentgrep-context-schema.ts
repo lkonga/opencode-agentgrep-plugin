@@ -466,6 +466,13 @@ function flattenRecordList(raw: unknown): unknown[] {
  *     bounded serializer so deep/large records are rejected without
  *     unbounded allocation
  *
+ * RECENCY: when a cap binds, the RECENT tail of the (chronological) input is
+ * retained rather than the oldest prefix — ingestion walks records from the
+ * END and prepends each admitted record, so exposures in the recent tail are
+ * never discarded merely because old records consumed the limits. Retained
+ * records stay in chronological order (the prepend walk yields the reverse
+ * source order; indices are re-assigned sequentially).
+ *
  * `fromActiveContext` marks the whole batch as post-compaction active-context
  * data (the v2 context endpoint is documented as "all messages after the last
  * compaction") so the builder can emit truthful markers without overclaiming.
@@ -481,7 +488,10 @@ export function normalizeContextMessages(
   const partsBudget: IngestPartsBudget = { parts: CONTEXT_CAP_PARTS }
 
   const records = flattenRecordList(raw)
-  for (const record of records) {
+  // Walk from the END (newest) so caps retain the recent tail; `unshift`
+  // keeps the final output chronological among retained records.
+  for (let i = records.length - 1; i >= 0; i--) {
+    const record = records[i]
     if (out.length >= CONTEXT_CAP_MESSAGES) {
       truncated = true
       break
@@ -510,10 +520,12 @@ export function normalizeContextMessages(
       stats.skipped++
       continue
     }
-    msg.index = out.length
     msg.fromActiveContext = msg.fromActiveContext ?? opts.fromActiveContext
-    out.push(msg)
+    out.unshift(msg)
   }
+  // Re-assign stable sequential indices over the retained (chronological) set
+  // so exposure position tuning reflects the retained window, not source order.
+  for (let i = 0; i < out.length; i++) out[i].index = i
   return { messages: out, skipped: stats.skipped, truncated: truncated || stats.truncated }
 }
 

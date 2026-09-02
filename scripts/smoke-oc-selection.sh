@@ -123,6 +123,78 @@ redact() {
 
 # ── Shared runner ────────────────────────────────────────────────────────────
 timeout_secs="${OC_SMOKE_TIMEOUT:-300}"
+
+# ── Fresh-host registry preflight ─────────────────────────────────────────────
+# Deterministic proof that the plugin loaded and registered `agentgrep` on a
+# FRESH in-process server BEFORE any model-choice assertion runs. We start our
+# own `oc serve` (same fresh-host env as the runs below) and query the
+# /experimental/tool/ids HTTP endpoint (the same route the SDK uses).
+#
+# KNOWN RESIDUAL (verified against g5kc oc 1.18.9-dev-patched):
+#   /experimental/tool and /experimental/tool/ids ALWAYS advertise the built-in
+#   grep/glob tools regardless of config.tools or config.permission — the
+#   registry endpoint lists every registered built-in tool unfiltered. The
+#   deny policy (agentgrep-policy.ts) therefore cannot be proven by registry
+#   introspection; it filters the tools OFFERED TO THE MODEL at request time
+#   (resolveTools / PermissionNext.disabled). We therefore:
+#     1. PROVE agentgrep is present in the fresh-host registry (plugin loaded).
+#     2. FAIL clearly if the introspection route is unavailable.
+#     3. RECORD the residual (built-in grep/glob still listed by the registry
+#        endpoint) — the actual absence is proven below by the model-choice
+#        assertions on the real `oc run` tool_use events after the deny is
+#        active (a called-and-denied or unoffered tool never appears as a
+#        native grep/glob tool_use).
+preflight_port="${OC_SMOKE_PREFLIGHT_PORT:-41887}"
+preflight() {
+  local pport="$preflight_port"
+  local serve_log="$SANDBOX/preflight-serve.log"
+  local ids_file="$SANDBOX/preflight-ids.json"
+
+  "$OC" serve --port "$pport" --hostname 127.0.0.1 >"$serve_log" 2>&1 &
+  local pid=$!
+  local ids=""
+  local ok=0
+  for _ in $(seq 1 30); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "PREFLIGHT-FAIL: oc serve exited early (see preflight-serve.log)." >&2
+      redact <"$serve_log" | tail -n 20 | sed 's/^/  /' >&2
+      exit 1
+    fi
+    ids="$(curl -sf --max-time 2 "http://127.0.0.1:$pport/experimental/tool/ids" 2>/dev/null || true)"
+    if [[ -n "$ids" ]]; then
+      ok=1
+      break
+    fi
+    sleep 1
+  done
+  if [[ "$ok" -ne 1 ]]; then
+    echo "PREFLIGHT-FAIL: cannot introspect offered tools via GET /experimental/tool/ids on fresh host (curl/serve unavailable)." >&2
+    echo "  Introspection unavailable on this oc build — cannot prove registry state. See preflight-serve.log." >&2
+    redact <"$serve_log" | tail -n 20 | sed 's/^/  /' >&2
+    kill "$pid" 2>/dev/null || true
+    exit 1
+  fi
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+
+  printf '%s' "$ids" >"$ids_file"
+
+  # 1. agentgrep MUST be present (plugin loaded + tool registered on fresh host).
+  if ! grep -q '"agentgrep"' "$ids_file"; then
+    echo "PREFLIGHT-FAIL: canonical agentgrep NOT present in fresh-host tool registry: $ids" >&2
+    exit 1
+  fi
+
+  # 2. Record the residual: built-in grep/glob are always listed by this
+  #    endpoint on g5kc oc (verified 1.18.9-dev-patched). This is EXPECTED —
+  #    the deny filters the model-request payload, not the registry listing.
+  if grep -q '"grep"' "$ids_file" || grep -q '"glob"' "$ids_file"; then
+    echo "  [preflight] RESIDUAL: native grep/glob still listed by /experimental/tool/ids (built-in registry always advertises them; deny filters the model request, proven below)." >&2
+  fi
+
+  echo "  [preflight] PASS: fresh-host registry advertises canonical agentgrep; introspection route verified live." >&2
+}
+preflight
 run_oc() {
   local label="$1"   # human-readable label for diagnostics
   local prompt="$2"  # the prompt to pass to oc run

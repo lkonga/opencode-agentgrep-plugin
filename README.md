@@ -204,6 +204,15 @@ keeps the native `grep`/`glob` tools enabled but does **not** register any
 compatibility aliases; `compatibilityAliases` registers aliases without
 changing native-tool behavior.
 
+**Canonical-only is the intentional user-mandated default.** The plugin exposes
+only `agentgrep` by default — this is a deliberate design choice, not an
+unresolved gap. The `find`, `Grep`, and `file_grep` compatibility aliases are
+**never** enabled unless explicitly requested via `compatibilityAliases`. JCode's
+inherent multi-alias behavior (where `find`, `grep`, `file_grep`, and `Grep` are
+registered implicitly) is intentionally not adopted. Aliases remain explicit
+opt-in compatibility helpers only, kept available for model migration scenarios;
+they are not a bug to be fixed.
+
 ### Tool schema
 
 The tool schema mirrors **jcode's public `parameters_schema`** exactly. Public

@@ -24,6 +24,7 @@ import {
   CONTEXT_CAP_LINE_RANGE,
   CONTEXT_CAP_STRING_LEN,
   CONTEXT_CAP_SQL_ROWS,
+  CONTEXT_CAP_SQL_BYTES,
   // bytes
   boundedUtf8Bytes,
   utf8ByteLength,
@@ -57,6 +58,8 @@ import {
   sanitizeContextOutput,
   hasContextJsonSignature,
   CONTEXT_REDACTED_OUTPUT,
+  CONTEXT_FRAGMENT_MIN,
+  containsContextFragment,
   CONTEXT_TEMP_PLACEHOLDER,
   // provider + tools
   createAgentGrepContextProvider,
@@ -361,6 +364,30 @@ describe("early/global caps in normalizeContextMessages", () => {
     expect(out.messages).toHaveLength(0)
     expect(out.truncated).toBe(true)
   })
+
+  test("caps retain the RECENT tail (exposures only at the end survive, chronological)", () => {
+    // 450 messages: the first 420 are empty; the last 30 carry read-part
+    // exposures. A cap of 400 messages must retain the recent 400 (the last
+    // 400), which includes the 30 exposures — never discard them because old
+    // empty rows consumed the cap.
+    const many: Array<{ info: Record<string, unknown>; parts: unknown[] }> = []
+    for (let i = 0; i < CONTEXT_CAP_MESSAGES + 50; i++) {
+      many.push(v1Msg("s1", i >= CONTEXT_CAP_MESSAGES ? [v1ReadPart(files.a, 1, 5)] : [], 1_000_000 + i))
+    }
+    const out = normalizeContextMessages(many, { sessionID: "s1" })
+    expect(out.truncated).toBe(true)
+    expect(out.messages.length).toBeLessThanOrEqual(CONTEXT_CAP_MESSAGES)
+    // The LAST normalized message is the newest source message with its exposure.
+    const last = out.messages[out.messages.length - 1]
+    expect(last.parts.some((p) => p.kind === "tool" && p.filePath === files.a)).toBe(true)
+    // Chronological order preserved among retained records.
+    const ts = out.messages.map((m) => m.timestamp)
+    for (let i = 1; i < ts.length; i++) {
+      expect(ts[i]!).toBeGreaterThanOrEqual(ts[i - 1]!)
+    }
+    // Stable sequential indices over the retained window.
+    out.messages.forEach((m, i) => expect(m.index).toBe(i))
+  })
 })
 
 describe("current-session filtering is COMPLETE (parts + nested records)", () => {
@@ -507,6 +534,61 @@ describe("sanitizeContextOutput", () => {
   test("inactive context → never redacts", () => {
     const text = "anything"
     expect(sanitizeContextOutput(text, { tempPath: null, contextJson: null })).toEqual({ text, redacted: false })
+  })
+
+  test("PREFIX fragment of the serialized JSON → whole stream redacted", () => {
+    const prefix = contextJson.slice(0, 120)
+    expect(prefix.length).toBe(120)
+    const res = sanitizeContextOutput(`child echoed: ${prefix}`, { tempPath, contextJson })
+    expect(res.redacted).toBe(true)
+    expect(res.text).toBe(CONTEXT_REDACTED_OUTPUT)
+  })
+
+  test("MIDDLE fragment missing the version marker → whole stream redacted", () => {
+    // A chunk cut from the middle of the JSON: contains context keys but NOT
+    // the `"version":1` marker and not the full exact JSON — only fragment
+    // detection can catch it. The slice must be a nontrivial fragment (≥
+    // CONTEXT_FRAGMENT_MIN) derived from the actual fixture length.
+    const middle = contextJson.slice(80, contextJson.length)
+    expect(middle.length).toBeGreaterThanOrEqual(CONTEXT_FRAGMENT_MIN)
+    expect(middle.includes('"version"')).toBe(false)
+    expect(contextJson.includes(middle)).toBe(true)
+    const res = sanitizeContextOutput(`noisy prefix ${middle} noisy suffix`, { tempPath, contextJson })
+    expect(res.redacted).toBe(true)
+    expect(res.text).toBe(CONTEXT_REDACTED_OUTPUT)
+  })
+
+  test("SUFFIX fragment of the serialized JSON → whole stream redacted", () => {
+    const suffix = contextJson.slice(-180)
+    expect(contextJson.includes(suffix)).toBe(true)
+    const res = sanitizeContextOutput(`tail: ${suffix}`, { tempPath, contextJson })
+    expect(res.redacted).toBe(true)
+    expect(res.text).toBe(CONTEXT_REDACTED_OUTPUT)
+  })
+
+  test("short key-pair without version (structural echo evidence) → redacted", () => {
+    const pair = '"known_files":[],"known_regions":[]'
+    const res = sanitizeContextOutput(`leak ${pair}`, { tempPath, contextJson })
+    expect(res.redacted).toBe(true)
+    expect(res.text).toBe(CONTEXT_REDACTED_OUTPUT)
+  })
+
+  test("legit AgentGrep output is never redacted by fragment/signature rules", () => {
+    const legit =
+      "1. src/a.ts\n" +
+      "structure:\n" +
+      "  - function auth_status @ 1-1 (1 lines)\n" +
+      "regions:\n" +
+      "  - auth_status @ 1-1\n" +
+      "src/a.ts:2:1: match line that mentions known_files? no — a plain hit\n"
+    const res = sanitizeContextOutput(legit, { tempPath, contextJson })
+    expect(res.redacted).toBe(false)
+    expect(res.text).toBe(legit)
+  })
+
+  test("harness-like fragments are NEVER redacted when context is inactive", () => {
+    const leak = `${contextJson.slice(0, 120)} ${contextJson.slice(-120)}`
+    expect(sanitizeContextOutput(leak, { tempPath: null, contextJson: null })).toEqual({ text: leak, redacted: false })
   })
 })
 
@@ -1237,6 +1319,149 @@ describe("SQLite fallback (guarded, exact-session)", () => {
       fs.rmSync(dir, { recursive: true, force: true })
     }
   })
+
+  test("row caps keep the RECENT tail with parts attached (old rows never starve exposures)", () => {
+    const { dir, db, close } = makeDbFixture()
+    try {
+      const { Database } = require("bun:sqlite") as typeof import("bun:sqlite")
+      const d = new Database(db)
+      d.exec(`INSERT INTO session (id, directory, path, title, version, slug, project_id) VALUES ('cur', '${ROOT.replaceAll("'", "''")}', NULL, 't', '1', 's', 'p')`)
+      const msgStmt = d.prepare(`INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, '{"role":"assistant"}')`)
+      d.exec("BEGIN")
+      for (let i = 0; i < CONTEXT_CAP_SQL_ROWS + 50; i++) msgStmt.run(`m${i}`, "cur", i, i)
+      d.exec("COMMIT")
+      // Part rows exist ONLY on the most recent 25 messages (the recent tail) —
+      // the old 2000+ rows must never starve them out.
+      const partStmt = d.prepare(
+        `INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, 'cur', ?, ?, ?)`,
+      )
+      d.exec("BEGIN")
+      for (let i = 0; i < 25; i++) {
+        const mid = CONTEXT_CAP_SQL_ROWS + 50 - 25 + i
+        partStmt.run(
+          `p${mid}`,
+          `m${mid}`,
+          mid,
+          mid,
+          `{"type":"tool","tool":"read","state":{"status":"completed","input":{"file_path":"${files.a.replaceAll("'", "''")}"}}}`,
+        )
+      }
+      d.exec("COMMIT")
+      d.close()
+      close()
+
+      const prev = process.env.OPENCODE_DATA_HOME
+      process.env.OPENCODE_DATA_HOME = dir
+      try {
+        const result = sqliteFallbackMessages("cur", [ROOT], undefined)!
+        expect(result.truncated).toBe(true)
+        expect(result.messages.length).toBeLessThanOrEqual(CONTEXT_CAP_SQL_ROWS)
+        // Recent-tail exposures survive: retained messages carry the read parts.
+        const withParts = result.messages.filter((m) => m.parts.length > 0)
+        expect(withParts.length).toBeGreaterThan(0)
+        // The newest source message is retained (chronological tail, not head).
+        expect(result.messages[result.messages.length - 1].info.id).toBe(`m${CONTEXT_CAP_SQL_ROWS + 49}`)
+        // Chronological order preserved among retained messages.
+        const times = result.messages.map((m) => ((m.info.time as any)?.created as number | undefined) ?? -1)
+        for (let i = 1; i < times.length; i++) expect(times[i]).toBeGreaterThanOrEqual(times[i - 1])
+      } finally {
+        if (prev === undefined) delete process.env.OPENCODE_DATA_HOME
+        else process.env.OPENCODE_DATA_HOME = prev
+      }
+    } finally {
+      close()
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("message BYTE pressure drops the OLDEST of the tail; small newest exposure survives with parts attached", () => {
+    const { dir, db, close } = makeDbFixture()
+    try {
+      const { Database } = require("bun:sqlite") as typeof import("bun:sqlite")
+      const d = new Database(db)
+      d.exec(`INSERT INTO session (id, directory, path, title, version, slug, project_id) VALUES ('cur', '${ROOT.replaceAll("'", "''")}', NULL, 't', '1', 's', 'p')`)
+      const huge = JSON.stringify({ role: "assistant", blob: "x".repeat(CONTEXT_CAP_SQL_BYTES) })
+      const small = '{"role":"assistant"}'
+      const msgStmt = d.prepare(`INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)`)
+      d.exec("BEGIN")
+      // Oldest rows are OVERSIZED; the newest 3 rows are tiny.
+      msgStmt.run("m0", "cur", 0, 0, huge)
+      msgStmt.run("m1", "cur", 1, 1, huge)
+      msgStmt.run("m2", "cur", 2, 2, small)
+      msgStmt.run("m3", "cur", 3, 3, small)
+      msgStmt.run("m4", "cur", 4, 4, small)
+      d.exec("COMMIT")
+      // The newest message carries a read exposure (must survive byte pressure).
+      const partData = `{"type":"tool","tool":"read","state":{"status":"completed","input":{"file_path":"${files.a.replaceAll("'", "''")}"}}}`
+      d.exec(`INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES ('p4', 'm4', 'cur', 4, 4, '${partData.replaceAll("'", "''")}')`)
+      d.close()
+      close()
+
+      const prev = process.env.OPENCODE_DATA_HOME
+      process.env.OPENCODE_DATA_HOME = dir
+      try {
+        const result = sqliteFallbackMessages("cur", [ROOT], undefined)!
+        expect(result.truncated).toBe(true)
+        // Newest 3 tiny messages retained (byte cap), oversized OLD rows dropped.
+        expect(result.messages.map((m) => m.info.id)).toEqual(["m2", "m3", "m4"])
+        // The newest exposure survived AND its part is attached.
+        const newest = result.messages[result.messages.length - 1]
+        expect(newest.info.id).toBe("m4")
+        expect(newest.parts.length).toBe(1)
+        expect(JSON.stringify(newest.parts[0])).toContain('"tool":"read"')
+      } finally {
+        if (prev === undefined) delete process.env.OPENCODE_DATA_HOME
+        else process.env.OPENCODE_DATA_HOME = prev
+      }
+    } finally {
+      close()
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("part BYTE pressure drops the OLDEST part rows; newest part exposure still attaches", () => {
+    const { dir, db, close } = makeDbFixture()
+    try {
+      const { Database } = require("bun:sqlite") as typeof import("bun:sqlite")
+      const d = new Database(db)
+      d.exec(`INSERT INTO session (id, directory, path, title, version, slug, project_id) VALUES ('cur', '${ROOT.replaceAll("'", "''")}', NULL, 't', '1', 's', 'p')`)
+      const msgStmt = d.prepare(`INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, '{"role":"assistant"}')`)
+      d.exec("BEGIN")
+      for (let i = 0; i < 4; i++) msgStmt.run(`m${i}`, "cur", i, i)
+      d.exec("COMMIT")
+      // Oldest message's part row is OVERSIZED; the newest message's part is tiny.
+      const hugePart = JSON.stringify({ type: "tool", tool: "read", state: { status: "completed", input: { file_path: files.a } }, blob: "x".repeat(CONTEXT_CAP_SQL_BYTES) })
+      const tinyPart = `{"type":"tool","tool":"read","state":{"status":"completed","input":{"file_path":"${files.a.replaceAll("'", "''")}"}}}`
+      const partStmt = d.prepare(`INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, 'cur', ?, ?, ?)`)
+      d.exec("BEGIN")
+      partStmt.run("p0", "m0", 0, 0, hugePart)
+      partStmt.run("p3", "m3", 3, 3, tinyPart)
+      d.exec("COMMIT")
+      d.close()
+      close()
+
+      const prev = process.env.OPENCODE_DATA_HOME
+      process.env.OPENCODE_DATA_HOME = dir
+      try {
+        const result = sqliteFallbackMessages("cur", [ROOT], undefined)!
+        expect(result.truncated).toBe(true)
+        // All 4 messages retained (their data is tiny); chronological order.
+        expect(result.messages.map((m) => m.info.id)).toEqual(["m0", "m1", "m2", "m3"])
+        // Newest part exposure attaches; the oversized OLD part row is dropped.
+        const newest = result.messages[result.messages.length - 1]
+        expect(newest.info.id).toBe("m3")
+        expect(newest.parts.length).toBe(1)
+        expect(JSON.stringify(newest.parts[0])).toContain('"tool":"read"')
+        expect(result.messages[0].parts.length).toBe(0)
+      } finally {
+        if (prev === undefined) delete process.env.OPENCODE_DATA_HOME
+        else process.env.OPENCODE_DATA_HOME = prev
+      }
+    } finally {
+      close()
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
 })
 
 // ── Secure tempfile ──────────────────────────────────────────────────────────
@@ -1666,15 +1891,19 @@ esac
     }
   })
 
-  test("internal smart execute keeps smart until argv building (query splits into DSL terms)", async () => {
+  test("public trace execute keeps argv split + context flag (no internal smart at execute)", async () => {
     const { tools, dir } = contextAwareTools()
     const ctx = ctxFor(dir)
     try {
       fs.writeFileSync(harness.record, "")
-      const res = objectResult(await tools.agentgrep.execute({ mode: "smart", query: "subject:a relation:b" }, ctx))
+      // The public execute schema exposes mode enum grep|find|outline|trace —
+      // NOT the internal `smart` alias. Context-bearing trace is tested with
+      // the public mode + terms array (smart stays an internal args-builder
+      // alias only; see the pure argv parity test below).
+      const res = objectResult(await tools.agentgrep.execute({ mode: "trace", terms: ["subject:a", "relation:b"] }, ctx))
       expect(res.metadata.ok).toBe(true)
       const rec = readRecord().find((l) => l.startsWith("trace\t"))
-      // smart+query → CLI subcommand trace with split DSL terms + context
+      // trace+terms → CLI subcommand trace with split DSL terms + context
       expect(rec).toContain("trace\t")
       expect(rec).toContain("subject:a")
       expect(rec).toContain("relation:b")
@@ -1717,7 +1946,7 @@ esac
       expect(globOnly).not.toContain("--context-json")
 
       fs.writeFileSync(harness.record, "")
-      await tools.agentgrep.execute({ mode: "find", file_type: "ts" }, ctx)
+      await tools.agentgrep.execute({ mode: "find", type: "ts" }, ctx)
       const typeOnly = readRecord().find((l) => l.startsWith("find\t"))
       expect(typeOnly).toContain("--type")
       expect(typeOnly).not.toContain("--context-json")

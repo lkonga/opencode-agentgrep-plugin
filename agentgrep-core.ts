@@ -34,6 +34,8 @@ export {
   AGENTGREP_ALIASES,
   AGENTGREP_CANONICAL_ID,
   AGENTGREP_FIND_ID,
+  AGENTGREP_INPUT_ALLOWLIST,
+  pickAgentGrepInput,
   resolveAgentGrepToolID,
   normalizeAgentGrepMode,
   normalizeMatchAllGlob,
@@ -57,10 +59,15 @@ export {
   buildAgentGrepArgs,
   exactFileScope,
   findSplitTerms,
+  globEscape,
   operationPatterns,
 } from "./agentgrep-args"
 
+export { compactGrepRegions, GREP_DEFAULT_MAX_REGIONS } from "./agentgrep-compact"
+
 export { buildAgentGrepTools } from "./agentgrep-tools"
+
+export { applyAgentGrepPolicy } from "./agentgrep-policy"
 
 export {
   askExternalDirectoryIfNeeded,
@@ -145,8 +152,10 @@ export { boundedUtf8Bytes, utf8ByteLength } from "./agentgrep-context-bytes"
 export type { BoundedBytes } from "./agentgrep-context-bytes"
 
 export {
+  CONTEXT_FRAGMENT_MIN,
   CONTEXT_REDACTED_OUTPUT,
   CONTEXT_TEMP_PLACEHOLDER,
+  containsContextFragment,
   hasContextJsonSignature,
   sanitizeContextOutput,
 } from "./agentgrep-context-sanitize"

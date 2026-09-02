@@ -23,10 +23,12 @@ import type { AgentGrepInput, AgentGrepMode, AgentGrepCompatibilityAlias, Resolv
 import {
   AGENTGREP_CANONICAL_ID,
   normalizeAgentGrepMode,
+  pickAgentGrepInput,
 } from "./agentgrep-types"
 import { buildAgentGrepArgs, exactFileScope, operationPatterns } from "./agentgrep-args"
 import { askExternalDirectoryIfNeeded, canonicalizePath, resolveModelRoots } from "./agentgrep-paths"
 import { resolveAgentGrepBin, runAgentGrep } from "./agentgrep-exec"
+import { compactGrepRegions, GREP_DEFAULT_MAX_REGIONS } from "./agentgrep-compact"
 import { createAgentGrepContextProvider, type AgentGrepContextProvider } from "./agentgrep-context"
 import { writeContextTempFile, type ContextTempFile } from "./agentgrep-context-temp"
 import { sanitizeContextOutput, type SanitizeResult } from "./agentgrep-context-sanitize"
@@ -60,24 +62,30 @@ function toolDescription(alias: string | null): string {
 /**
  * Shared execute body for all agentgrep-family tools.
  *
- * Permission flow (before any spawn):
+ * SECURITY BOUNDARY (first): the raw model input is immediately closed through
+ * `pickAgentGrepInput` into a canonical PUBLIC-ONLY object — before any roots,
+ * patterns, permission asks, metadata, or provider/context work. Reserved/
+ * internal keys (pattern, file_path, include, file_type, max_items, hidden,
+ * no_ignore, full_region, debug_plan, debug_score, __fileScope, __contextJson)
+ * and unknown keys are discarded, and raw mode "smart" is rejected, so they
+ * can never be reintroduced as a trusted scope/query/filter and no ask or
+ * provider call happens for rejected input. ONLY the sanitized object is used
+ * downstream.
+ *
+ * Permission flow (after sanitization, before any spawn):
  *   1. `agentgrep` ask — canonical operation pattern(s), always ["*"].
  *   2. `external_directory` asks for roots outside directory/worktree (native
  *      canonical glob + metadata, deduped).
  * Denials reject execute (they are NOT converted to tool results), so a denied
  * call can never spawn the agentgrep process.
  *
- * Harness context (trace/smart/outline only): built AFTER permission asks so a
+ * Harness context (trace/outline only): built AFTER permission asks so a
  * denied call never triggers SDK/SQLite/stat work, and its failures degrade to
  * "no context" (never affect permission, path, argv, or search behavior). The
  * context tempfile is removed in a `finally` on success/nonzero/timeout/abort/
- * error, and its path never leaks into asks, results, or metadata.
- *
- * NOTE (hidden-smart parity): `input.mode` is threaded through RAW into the
- * args builder so `smart` + multiword `query` still splits into trace DSL terms
- * inside buildAgentGrepArgs/operationPatterns, while the CLI subcommand is
- * resolved to `trace`. `resolvedMode` (smart → trace) is used only for
- * metadata; it does NOT overwrite the raw mode.
+ * error, and its path never leaks into asks, results, or metadata. The
+ * provider receives ONLY the sanitized public input. `resolvedMode` (public
+ * mode name, e.g. trace from the caller's normalization) is used for metadata.
  */
 async function executeAgentGrep(
   input: Record<string, any>,
@@ -86,8 +94,34 @@ async function executeAgentGrep(
   provider: AgentGrepContextProvider,
 ): Promise<ToolResult> {
   const title = `agentgrep ${resolvedMode}`
-  const roots = resolveModelRoots(input, resolvedMode, ctx.directory)
-  const patterns = operationPatterns(resolvedMode, input)
+
+  // ⚠️ SECURITY BOUNDARY — build the CLOSED public-only input FIRST, before any
+  // roots, patterns, permission asks, metadata, or provider/context work. The
+  // raw model input is never read downstream: reserved/internal keys
+  // (pattern, file_path, include, file_type, max_items, hidden, no_ignore,
+  // full_region, debug_plan, debug_score, __fileScope, __contextJson, and
+  // unknown keys) are discarded here, and raw mode "smart" is rejected — so
+  // they can never be reintroduced as a trusted scope/query/filter, and no
+  // permission ask or provider call happens for rejected input. ONLY trusted
+  // code below appends the internal fields (__fileScope/__contextJson) after
+  // canonical permission/context processing.
+  let normalized: AgentGrepInput
+  try {
+    normalized = pickAgentGrepInput(input)
+  } catch (err) {
+    const safe = sanitizeContextOutput((err as Error)?.message ?? String(err), {
+      tempPath: null,
+      contextJson: null,
+    })
+    return {
+      title,
+      output: `agentgrep: invalid arguments: ${safe.text}`,
+      metadata: { mode: resolvedMode, ok: false },
+    }
+  }
+
+  const roots = resolveModelRoots(normalized, resolvedMode, ctx.directory)
+  const patterns = operationPatterns(resolvedMode, normalized)
 
   await ctx.ask({
     permission: "agentgrep",
@@ -97,12 +131,11 @@ async function executeAgentGrep(
       mode: resolvedMode,
       pattern: patterns.join(" ") || undefined,
       path: roots.path?.full ?? ctx.directory,
-      include: input.glob ?? input.include,
+      include: normalized.glob ?? normalized.include,
     },
   })
   await askExternalDirectoryIfNeeded(ctx, roots)
 
-  let normalized: AgentGrepInput
   let contextTemp: ContextTempFile | null = null
   let contextJson: string | null = null
   // While a context file is active, every stream returned by execute must be
@@ -110,10 +143,6 @@ async function executeAgentGrep(
   const sanitize = (text: string): SanitizeResult =>
     sanitizeContextOutput(text, { tempPath: contextTemp?.path ?? null, contextJson })
   try {
-    // Keep the RAW caller mode so smart query-splitting survives into the args
-    // builder; the mode is resolved per-call, never pinned by the tool id.
-    normalized = { ...input }
-
     if (roots.path?.isExactFile) {
       const scope = exactFileScope(roots.path.full, roots.path.kind)
       if (scope) normalized.__fileScope = scope
@@ -125,7 +154,7 @@ async function executeAgentGrep(
       if (!roots.path) normalized.path = canonicalizePath(path.resolve(ctx.directory, "."))
     }
 
-    // Harness context for trace/smart/outline only (jcode parity). Guarded so
+    // Harness context for trace/outline only (jcode parity). Guarded so
     // failures here never affect the tool's other behavior. The search root for
     // context is always a DIRECTORY (the project root / directory-valued path
     // root) — never an exact-file leaf — because context paths serialize
@@ -135,7 +164,7 @@ async function executeAgentGrep(
         roots.path && roots.path.kind === "directory"
           ? roots.path.full
           : canonicalizePath(path.resolve(ctx.directory, "."))
-      const json = await provider.getHarnessJson(input, ctx, searchRoot)
+      const json = await provider.getHarnessJson(normalized, ctx, searchRoot)
       contextJson = json
       contextTemp = writeContextTempFile(json)
       if (contextTemp) normalized.__contextJson = contextTemp.path
@@ -182,8 +211,21 @@ async function executeAgentGrep(
       cwd: ctx.directory,
       signal: ctx.abort,
     })
-    const stdout = sanitize(result.stdout)
+    // Grep-only result-level region cap: AgentGrep v0.1.6 grep has no
+    // `--max-regions` flag (trace only), so the public `max_regions` controls
+    // a post-execution cap over match lines — omitted means 200. Non-grep
+    // modes pass through untouched; the raw stdout is already bounded by the
+    // exec layer, so no buffering/spawn behavior changes.
+    const compacted =
+      resolvedMode === "grep" && normalized
+        ? compactGrepRegions(result.stdout, normalized.max_regions ?? GREP_DEFAULT_MAX_REGIONS)
+        : null
+    const stdoutRaw = compacted ? compacted.text : result.stdout
+    const stdout = sanitize(stdoutRaw)
     const stderr = sanitize(result.stderr)
+    const compactMetadata = compacted && compacted.capped
+      ? { regionsCapped: true, regions: compacted.regions, maxRegions: normalized!.max_regions ?? GREP_DEFAULT_MAX_REGIONS }
+      : {}
     if (result.timedOut) {
       return {
         title,
@@ -226,6 +268,7 @@ async function executeAgentGrep(
         truncated: result.truncated || undefined,
         boundKilled: result.boundKilled,
         contextRedacted: stdout.redacted || stderr.redacted || undefined,
+        ...compactMetadata,
       },
     }
   } catch (err) {
@@ -295,7 +338,9 @@ function buildTool(alias: string | null, provider: AgentGrepContextProvider): To
         .int()
         .positive()
         .optional()
-        .describe("Max matching regions per query (trace; CLI-side default 6)."),
+        .describe(
+          "Max matching regions per query (trace: CLI-side default 6; grep: post-execution result cap, default 200).",
+        ),
       paths_only: tool.schema
         .boolean()
         .optional()

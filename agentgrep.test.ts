@@ -14,18 +14,22 @@ import {
   AGENTGREP_ALIASES,
   AGENTGREP_CANONICAL_ID,
   AGENTGREP_GUIDANCE_MARKER,
+  AGENTGREP_INPUT_ALLOWLIST,
   agentgrepSystemGuidance,
   applyAgentGrepSystemGuidance,
   buildAgentGrepArgs,
   buildAgentGrepTools,
   exactFileScope,
+  globEscape,
   normalizeAgentGrepMode,
   normalizeMatchAllGlob,
   operationPatterns,
+  pickAgentGrepInput,
   resolveAgentGrepToolID,
   sanitizeAgentGrepPluginOptions,
   tryResolveAgentGrepBin,
   agentGrepDefaultBin,
+  applyAgentGrepPolicy,
 } from "./agentgrep-core"
 // The default plugin is loaded from the entrypoint, exactly as OpenCode does.
 import agentGrepPlugin from "./index"
@@ -124,6 +128,175 @@ describe("entrypoint module shape (loader constraint)", () => {
     const before = output.system.length
     await transform!({ sessionID: "s", model: {} as never }, output)
     expect(output.system.length).toBe(before) // idempotent: no duplicate guidance
+  })
+})
+
+// ── Config-hook deny policy matrix (agentgrep-policy.ts) ─────────────────────
+//
+// The plugin config hook applies an AUTHORITATIVE "deny" permission policy for
+// native `grep` and `glob` at BOTH the global config.permission level AND every
+// explicitly configured agent's permission block (an agent override would
+// otherwise supersede the global deny). The legacy `config.tools.grep/glob =
+// false` is preserved as a secondary guard. Unrelated permissions/settings and
+// their order are preserved; existing denials are never weakened.
+//
+// The Config shape (from @opencode-ai/sdk) supports:
+//   config.permission: { [tool]: "ask" | "allow" | "deny" }
+//   config.agent:      { [name]: AgentConfig }  — each with its own permission block
+//   config.tools:      { [tool]: boolean }
+// Native tools may also be given as a per-command map (object form, e.g. bash
+// command patterns), which must be preserved untouched.
+
+describe("config-hook deny policy (agentgrep-policy)", () => {
+  test("absent permission + absent tools: both are created with grep/glob deny", async () => {
+    const hooks = await agentGrepPlugin(makePluginInput())
+    const config: Record<string, any> = {}
+    hooks.config?.(config)
+    expect(config.permission).toEqual({ grep: "deny", glob: "deny" })
+    expect(config.tools).toEqual({ grep: false, glob: false })
+  })
+
+  test("scalar unrelated global permissions are preserved; grep/glob added as deny", async () => {
+    const hooks = await agentGrepPlugin(makePluginInput())
+    const config: Record<string, any> = { permission: { bash: "allow", edit: "ask" } }
+    hooks.config?.(config)
+    expect(config.permission).toEqual({ bash: "allow", edit: "ask", grep: "deny", glob: "deny" })
+  })
+
+  test("object (per-command map) unrelated permissions are preserved untouched", async () => {
+    const hooks = await agentGrepPlugin(makePluginInput())
+    const bashMap = { "npm test": "allow", "rm -rf": "deny" }
+    const config: Record<string, any> = { permission: { bash: bashMap } }
+    hooks.config?.(config)
+    expect(config.permission.bash).toEqual(bashMap) // identical reference preserved
+    expect(config.permission).toEqual({ bash: bashMap, grep: "deny", glob: "deny" })
+  })
+
+  test("existing native allow is overridden to deny", async () => {
+    const hooks = await agentGrepPlugin(makePluginInput())
+    const config: Record<string, any> = { permission: { grep: "allow", glob: "allow" } }
+    hooks.config?.(config)
+    expect(config.permission.grep).toBe("deny")
+    expect(config.permission.glob).toBe("deny")
+  })
+
+  test("existing native ask is overridden to deny", async () => {
+    const hooks = await agentGrepPlugin(makePluginInput())
+    const config: Record<string, any> = { permission: { grep: "ask", glob: "ask" } }
+    hooks.config?.(config)
+    expect(config.permission.grep).toBe("deny")
+    expect(config.permission.glob).toBe("deny")
+  })
+
+  test("existing native deny is preserved (never weakened)", async () => {
+    const hooks = await agentGrepPlugin(makePluginInput())
+    const config: Record<string, any> = { permission: { grep: "deny", glob: "deny" } }
+    hooks.config?.(config)
+    expect(config.permission.grep).toBe("deny")
+    expect(config.permission.glob).toBe("deny")
+    // No unrelated keys invented.
+    expect(Object.keys(config.permission).sort()).toEqual(["glob", "grep"])
+  })
+
+  test("legacy tools.grep/glob=false is preserved as a secondary guard", async () => {
+    const hooks = await agentGrepPlugin(makePluginInput())
+    const config: Record<string, any> = { tools: { read: true, bash: true } }
+    hooks.config?.(config)
+    expect(config.tools.grep).toBe(false)
+    expect(config.tools.glob).toBe(false)
+    expect(config.tools.read).toBe(true)
+    expect(config.tools.bash).toBe(true)
+  })
+
+  test("existing tools.grep/glob=true is overridden to false", async () => {
+    const hooks = await agentGrepPlugin(makePluginInput())
+    const config: Record<string, any> = { tools: { grep: true, glob: true } }
+    hooks.config?.(config)
+    expect(config.tools.grep).toBe(false)
+    expect(config.tools.glob).toBe(false)
+  })
+
+  test("all explicitly configured agents are hardened with grep/glob deny", async () => {
+    const hooks = await agentGrepPlugin(makePluginInput())
+    const config: Record<string, any> = {
+      agent: {
+        build: { permission: { bash: "allow" } },
+        plan: {},
+        custom: { permission: { grep: "allow", glob: "allow" } },
+      },
+    }
+    hooks.config?.(config)
+    for (const name of ["build", "plan", "custom"]) {
+      expect(config.agent[name].permission.grep, `${name} grep`).toBe("deny")
+      expect(config.agent[name].permission.glob, `${name} glob`).toBe("deny")
+    }
+    // Unrelated agent rules survive.
+    expect(config.agent.build.permission.bash).toBe("allow")
+    // Allow → deny override worked.
+    expect(config.agent.custom.permission.grep).toBe("deny")
+  })
+
+  test("agent-level unrelated permissions and order are preserved", async () => {
+    const hooks = await agentGrepPlugin(makePluginInput())
+    const config: Record<string, any> = {
+      agent: {
+        build: { permission: { bash: "ask", edit: "allow", grep: "allow" } },
+      },
+    }
+    hooks.config?.(config)
+    // Original keys keep their relative order; grep overwritten in place; glob appended.
+    const keys = Object.keys(config.agent.build.permission)
+    expect(keys.indexOf("bash")).toBeLessThan(keys.indexOf("edit"))
+    expect(keys.indexOf("edit")).toBeLessThan(keys.indexOf("grep"))
+    expect(config.agent.build.permission.bash).toBe("ask")
+    expect(config.agent.build.permission.edit).toBe("allow")
+    expect(config.agent.build.permission.grep).toBe("deny")
+    expect(config.agent.build.permission.glob).toBe("deny")
+  })
+
+  test("non-object agent values are skipped (never crash)", async () => {
+    const hooks = await agentGrepPlugin(makePluginInput())
+    const config: Record<string, any> = {
+      agent: { build: null, plan: "primary" },
+    }
+    hooks.config?.(config)
+    expect(config.agent.build).toBeNull()
+    expect(config.agent.plan).toBe("primary")
+    // Global deny still applied.
+    expect(config.permission.grep).toBe("deny")
+  })
+
+  test("agents without permission block get one created (only when replaceNativeSearch)", async () => {
+    const hooks = await agentGrepPlugin(makePluginInput())
+    const config: Record<string, any> = { agent: { build: {} } }
+    hooks.config?.(config)
+    expect(config.agent.build.permission).toEqual({ grep: "deny", glob: "deny" })
+  })
+
+  test("replaceNativeSearch:false leaves permission/agent/tools untouched", async () => {
+    const hooks = await agentGrepPlugin(makePluginInput(), { replaceNativeSearch: false })
+    const config: Record<string, any> = {
+      permission: { grep: "allow" },
+      tools: { grep: true },
+      agent: { build: { permission: { grep: "allow" } } },
+    }
+    hooks.config?.(config)
+    expect(config.permission).toEqual({ grep: "allow" })
+    expect(config.tools).toEqual({ grep: true })
+    expect(config.agent.build.permission).toEqual({ grep: "allow" })
+  })
+
+  test("applyAgentGrepPolicy is idempotent (repeated runs stable)", () => {
+    const config: Record<string, any> = {
+      permission: { bash: "allow", grep: "ask" },
+      tools: { read: true, grep: true },
+      agent: { build: { permission: { bash: "ask", glob: "allow" } } },
+    }
+    applyAgentGrepPolicy(config)
+    applyAgentGrepPolicy(config)
+    expect(config.permission).toEqual({ bash: "allow", grep: "deny", glob: "deny" })
+    expect(config.tools).toEqual({ read: true, grep: false, glob: false })
+    expect(config.agent.build.permission).toEqual({ bash: "ask", grep: "deny", glob: "deny" })
   })
 })
 
@@ -499,6 +672,44 @@ describe("exactFileScope", () => {
     expect(exactFileScope("/repo/src", "directory", "*.ts")).toBeNull()
     expect(exactFileScope("/repo/src", "directory")).toBeNull()
   })
+
+  test("exact-file basename is glob-escaped so the scope matches ONLY the literal file", () => {
+    // A raw `*`/`?`/`[`/`{`/`\` basename must never over-match siblings.
+    expect(exactFileScope("/repo/src/a*.ts", "file")).toEqual({
+      root: "/repo/src",
+      glob: "a\\*.ts",
+    })
+    expect(exactFileScope("/repo/src/a?.ts", "file")).toEqual({
+      root: "/repo/src",
+      glob: "a\\?.ts",
+    })
+    expect(exactFileScope("/repo/src/a[1].ts", "file")).toEqual({
+      root: "/repo/src",
+      glob: "a\\[1\\].ts",
+    })
+    expect(exactFileScope("/repo/src/a{b}.ts", "file")).toEqual({
+      root: "/repo/src",
+      glob: "a\\{b\\}.ts",
+    })
+    expect(exactFileScope("/repo/src/a\\b.ts", "file")).toEqual({
+      root: "/repo/src",
+      glob: "a\\\\b.ts",
+    })
+    // A plain basename is unchanged.
+    expect(exactFileScope("/repo/src/a.ts", "file")).toEqual({
+      root: "/repo/src",
+      glob: "a.ts",
+    })
+  })
+
+  test("globEscape escapes every glob metacharacter", () => {
+    expect(globEscape("a*.ts")).toBe("a\\*.ts")
+    expect(globEscape("a?.ts")).toBe("a\\?.ts")
+    expect(globEscape("a[1].ts")).toBe("a\\[1\\].ts")
+    expect(globEscape("a{b}.ts")).toBe("a\\{b\\}.ts")
+    expect(globEscape("a\\b.ts")).toBe("a\\\\b.ts")
+    expect(globEscape("plain.ts")).toBe("plain.ts")
+  })
 })
 
 // ── buildAgentGrepArgs ───────────────────────────────────────────────────────
@@ -792,6 +1003,96 @@ describe("buildAgentGrepArgs", () => {
       buildAgentGrepArgs({ mode: "trace", terms: ["subject:x", "relation:y"], file_type: "ts" }),
     ).toEqual(["trace", "subject:x", "relation:y", "--max-regions", "6", "--type", "ts", "--max-files", "5"])
   })
+
+  // ── Public `type` → internal `file_type` normalization (Item 2) ─────
+
+  test("grep: public `type` is normalized to argv --type (file_type alias)", () => {
+    expect(buildAgentGrepArgs({ mode: "grep", query: "auth", type: "rs" })).toEqual(["grep", "auth", "--type", "rs"])
+  })
+
+  test("grep: file_type alias also works alongside public `type`", () => {
+    // public `type` wins when both provided
+    expect(buildAgentGrepArgs({ mode: "grep", query: "auth", type: "rs", file_type: "ts" })).toEqual(["grep", "auth", "--type", "rs"])
+  })
+
+  test("find: public `type` is normalized to argv --type", () => {
+    expect(buildAgentGrepArgs({ mode: "find", query: "session", type: "ts" })).toEqual([
+      "find", "session", "--type", "ts", "--max-files", "10",
+    ])
+  })
+
+  test("find: public `type` alone counts as a narrowing scope (no terms needed)", () => {
+    expect(buildAgentGrepArgs({ mode: "find", type: "rs" })).toEqual([
+      "find", "", "--type", "rs", "--max-files", "10",
+    ])
+  })
+
+  test("trace: public `type` is normalized to argv --type", () => {
+    expect(
+      buildAgentGrepArgs({ mode: "trace", terms: ["subject:x"], type: "py" }),
+    ).toEqual(["trace", "subject:x", "--max-regions", "6", "--type", "py", "--max-files", "5"])
+  })
+
+  // ── Leading-dash safety (Item 4) ─────────────────────────────────────
+
+  test("grep: leading-dash query uses `--` end-of-options marker", () => {
+    const argv = buildAgentGrepArgs({ mode: "grep", query: "--regex", path: "/repo" })
+    expect(argv).toEqual(["grep", "--path", "/repo", "--", "--regex"])
+  })
+
+  test("grep: leading-dash query with flags uses `--` after flags", () => {
+    const argv = buildAgentGrepArgs({ mode: "grep", query: "--regex", regex: true, path: "/repo" })
+    expect(argv).toEqual(["grep", "--regex", "--path", "/repo", "--", "--regex"])
+  })
+
+  test("find: leading-dash terms use `--` end-of-options marker", () => {
+    const argv = buildAgentGrepArgs({ mode: "find", terms: ["--leading", "term"], path: "/repo" })
+    expect(argv).toEqual(["find", "--max-files", "10", "--path", "/repo", "--", "--leading", "term"])
+  })
+
+  test("find: leading-dash query uses `--`", () => {
+    const argv = buildAgentGrepArgs({ mode: "find", query: "--leading", path: "/repo" })
+    expect(argv).toEqual(["find", "--max-files", "10", "--path", "/repo", "--", "--leading"])
+  })
+
+  test("outline: leading-dash file uses `--` end-of-options marker", () => {
+    const argv = buildAgentGrepArgs({ mode: "outline", file: "---foo", path: "/repo" })
+    expect(argv).toEqual(["outline", "--path", "/repo", "--", "---foo"])
+  })
+
+  test("trace: leading-dash term uses `--` end-of-options marker", () => {
+    const argv = buildAgentGrepArgs({ mode: "trace", terms: ["---weird"] })
+    expect(argv).toEqual(["trace", "--max-regions", "6", "--max-files", "5", "--", "---weird"])
+  })
+
+  test("leading-dash type value is REJECTED with clear error", () => {
+    expect(() => buildAgentGrepArgs({ mode: "grep", query: "x", type: "-rs" })).toThrow(
+      /type.*starts with "-"|cannot be passed safely/i,
+    )
+  })
+
+  test("leading-dash glob value is REJECTED with clear error", () => {
+    expect(() => buildAgentGrepArgs({ mode: "grep", query: "x", glob: "--foo" })).toThrow(
+      /glob.*starts with "-"|cannot be passed safely/i,
+    )
+  })
+
+  test("leading-dash glob is not rejected for outline mode (glob is dropped there)", () => {
+    // outline ignores --glob, so no rejection needed
+    expect(() => buildAgentGrepArgs({ mode: "outline", file: "a.ts", glob: "--foo" })).not.toThrow()
+  })
+
+  test("leading-dash type is not rejected for outline mode (type is dropped there)", () => {
+    expect(() => buildAgentGrepArgs({ mode: "outline", file: "a.ts", type: "-rs" })).not.toThrow()
+  })
+
+  test("normal query without leading dash is unchanged (no `--` marker)", () => {
+    expect(buildAgentGrepArgs({ mode: "grep", query: "auth", path: "/repo" })).toEqual(["grep", "auth", "--path", "/repo"])
+  })
+
+  test("find empty positional bridge without leading dash is unchanged", () => {
+    expect(buildAgentGrepArgs({ mode: "find", glob: "*.ts" })).toEqual(["find", "", "--max-files", "10", "--glob", "*.ts"])
+  })
 })
 
 // ── Permission operation patterns (must match the split argv terms) ──────────
@@ -831,6 +1132,160 @@ describe("operationPatterns", () => {
       "subject:x",
       "relation:y",
     ])
+  })
+})
+
+// ── pickAgentGrepInput (closed allowlist) ────────────────────────────────────
+
+describe("pickAgentGrepInput — closed allowlist", () => {
+  test("picks public schema keys", () => {
+    const out = pickAgentGrepInput({ mode: "grep", query: "x", path: "/r", file: "a.ts", terms: "x", regex: true, glob: "*.ts", type: "rs", max_files: 5, max_regions: 3, paths_only: true })
+    expect(out.mode).toBe("grep")
+    expect(out.query).toBe("x")
+    expect(out.path).toBe("/r")
+    expect(out.file).toBe("a.ts")
+    expect(out.terms).toBe("x")
+    expect(out.regex).toBe(true)
+    expect(out.glob).toBe("*.ts")
+    expect(out.file_type).toBe("rs")
+    expect(out.max_files).toBe(5)
+    expect(out.max_regions).toBe(3)
+    expect(out.paths_only).toBe(true)
+  })
+
+  test("normalizes public `type` to internal `file_type`", () => {
+    const out = pickAgentGrepInput({ type: "rs" })
+    expect(out.file_type).toBe("rs")
+  })
+
+  test("discards __fileScope and __contextJson from model input", () => {
+    const out = pickAgentGrepInput({
+      query: "x",
+      __fileScope: { root: "/etc", glob: "passwd" },
+      __contextJson: "/etc/passwd",
+    })
+    expect((out as any).__fileScope).toBeUndefined()
+    expect((out as any).__contextJson).toBeUndefined()
+    expect(out.query).toBe("x")
+  })
+
+  test("discards unknown keys", () => {
+    const out = pickAgentGrepInput({ mode: "grep", query: "x", malicious: "evil" })
+    expect(out.mode).toBe("grep")
+    expect(out.query).toBe("x")
+    expect((out as any).malicious).toBeUndefined()
+  })
+
+  test("discards EVERY reserved/internal key from model input", () => {
+    const out = pickAgentGrepInput({
+      mode: "grep",
+      query: "x",
+      pattern: "foo", // internal alias — must be discarded (model must use `query`)
+      file_path: "bar", // internal alias — must be discarded (model must use `file`)
+      include: "*.rs", // internal alias — must be discarded (model must use `glob`)
+      file_type: "ts", // internal — must be discarded (model must use `type`)
+      max_items: 50, // internal — must be discarded
+      hidden: true, // internal — must be discarded
+      no_ignore: true, // internal — must be discarded
+      full_region: "always", // internal — must be discarded
+      debug_plan: true, // internal — must be discarded
+      debug_score: true, // internal — must be discarded
+      __fileScope: { root: "/etc", glob: "passwd" }, // internal — must be discarded
+      __contextJson: "/etc/passwd", // internal — must be discarded
+      bogus: "nope", // unknown — must be discarded
+    })
+    expect(out.mode).toBe("grep")
+    expect(out.query).toBe("x")
+    for (const reserved of [
+      "pattern",
+      "file_path",
+      "include",
+      "file_type",
+      "max_items",
+      "hidden",
+      "no_ignore",
+      "full_region",
+      "debug_plan",
+      "debug_score",
+      "__fileScope",
+      "__contextJson",
+      "bogus",
+    ]) {
+      expect((out as any)[reserved], `${reserved} must be discarded from model input`).toBeUndefined()
+    }
+  })
+
+  test("public aliases are honored: query→query, glob→glob, file→file", () => {
+    const out = pickAgentGrepInput({ query: "x", glob: "*.ts", file: "a.ts" })
+    expect(out.query).toBe("x")
+    expect(out.glob).toBe("*.ts")
+    expect(out.file).toBe("a.ts")
+    expect((out as any).pattern).toBeUndefined()
+    expect((out as any).include).toBeUndefined()
+    expect((out as any).file_path).toBeUndefined()
+  })
+
+  test("raw file_type is NEVER accepted; only public `type` maps to it", () => {
+    expect(pickAgentGrepInput({ file_type: "rs" }).file_type).toBeUndefined()
+    const viaPublic = pickAgentGrepInput({ type: "rs" })
+    expect(viaPublic.file_type).toBe("rs")
+    // Public `type` wins even when a raw internal file_type is smuggled alongside.
+    const mixed = pickAgentGrepInput({ type: "rs", file_type: "py" })
+    expect(mixed.file_type).toBe("rs")
+  })
+
+  test("raw mode \"smart\" is REJECTED (internal alias; public modes only)", () => {
+    expect(() => pickAgentGrepInput({ mode: "smart" })).toThrow(/smart.*internal|internal alias/i)
+    expect(() => pickAgentGrepInput({ mode: "smart", query: "x" })).toThrow(/smart/i)
+  })
+
+  test("unknown mode values are REJECTED", () => {
+    expect(() => pickAgentGrepInput({ mode: "rg" })).toThrow(/unknown agentgrep mode/)
+    expect(() => pickAgentGrepInput({ mode: "trace-ish" })).toThrow(/unknown agentgrep mode/)
+  })
+
+  test("public modes pass through; omitted/null mode defaults downstream", () => {
+    for (const m of ["grep", "find", "outline", "trace"] as const) {
+      expect(pickAgentGrepInput({ mode: m }).mode).toBe(m)
+    }
+    expect(pickAgentGrepInput({ query: "x" }).mode).toBeUndefined()
+    expect(pickAgentGrepInput({ mode: null, query: "x" }).mode).toBeUndefined()
+  })
+
+  test("AGENTGREP_INPUT_ALLOWLIST contains EXACTLY the canonical public schema keys", () => {
+    expect(AGENTGREP_INPUT_ALLOWLIST.size).toBe(11)
+    for (const pub of [
+      "mode",
+      "query",
+      "file",
+      "terms",
+      "regex",
+      "path",
+      "glob",
+      "type",
+      "max_files",
+      "max_regions",
+      "paths_only",
+    ]) {
+      expect(AGENTGREP_INPUT_ALLOWLIST.has(pub), `${pub} must be public`).toBe(true)
+    }
+    // Every reserved/internal key must be ABSENT from the allowlist.
+    for (const reserved of [
+      "pattern",
+      "file_path",
+      "include",
+      "file_type",
+      "max_items",
+      "hidden",
+      "no_ignore",
+      "full_region",
+      "debug_plan",
+      "debug_score",
+      "__fileScope",
+      "__contextJson",
+    ]) {
+      expect(AGENTGREP_INPUT_ALLOWLIST.has(reserved), `${reserved} must NOT be in the public allowlist`).toBe(false)
+    }
   })
 })
 

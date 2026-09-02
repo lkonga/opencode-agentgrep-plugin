@@ -16,6 +16,14 @@
 //   - The session row's canonical `directory` must match ctx.directory or
 //     ctx.worktree (canonical comparison) before any message/part read.
 //   - Row counts and accumulated `data` bytes are bounded.
+//   - Message AND part queries read the RECENT TAIL (`ORDER BY time_created
+//     DESC, id DESC LIMIT`) and are byte-charged NEWEST-first, so byte
+//     pressure drops the OLDEST of the selected tail — never the newest
+//     exposures. Admitted messages and part buckets are reversed to
+//     chronological order for the normalizer, and part rows are attached to
+//     every retained message even when the message rows themselves were
+//     truncated — so old rows consuming the row/byte limits can never discard
+//     useful exposures in the recent tail.
 //   - Every error is caught; the DB is always closed.
 //
 // Output: an array of v1-shaped `{ info, parts }` records reconstructed from
@@ -134,7 +142,7 @@ export function sessionDirectoryMatches(
 }
 
 export interface SqliteReadResult {
-  /** v1-shaped `{ info, parts }` records, oldest first. */
+  /** v1-shaped `{ info, parts }` records, chronological among the recent tail. */
   messages: Array<{ info: Record<string, unknown>; parts: Array<Record<string, unknown>> }>
   /** True when row/byte bounds cut the read short. */
   truncated: boolean
@@ -178,7 +186,7 @@ export function readSessionMessagesFromSqlite(
     if (!sessionRow) return empty
     if (!sessionDirectoryMatches(sessionRow.directory, ctxDirectories)) return empty
 
-    // 2. Bounded messages.
+    // 2. Bounded messages — recent tail (DESC LIMIT, newest-first byte charge).
     const messages: Array<{ info: Record<string, unknown>; parts: Array<Record<string, unknown>> }> = []
     let bytes = 0
     let truncated = false
@@ -188,34 +196,27 @@ export function readSessionMessagesFromSqlite(
         { id: string; session_id: string; time_created: number | null; data: string },
         [string, number]
       >(
-        "SELECT id, session_id, time_created, data FROM message WHERE session_id = ? ORDER BY time_created ASC, id ASC LIMIT ?",
+        "SELECT id, session_id, time_created, data FROM message WHERE session_id = ? ORDER BY time_created DESC, id DESC LIMIT ?",
       )
       .all(sessionID, CONTEXT_CAP_SQL_ROWS + 1)
     if (msgRows.length > CONTEXT_CAP_SQL_ROWS) {
       truncated = true
       msgRows.length = CONTEXT_CAP_SQL_ROWS
     }
+    // Charge/admit NEWEST-first (msgRows are DESC), so byte pressure drops the
+    // OLDEST of the selected tail; newest exposures survive.  Reverse admitted
+    // messages to chronological order for the normalizer.
     const partsByMessage = new Map<string, Array<Record<string, unknown>>>()
 
-    const partRows = db
-      .query<
-        { id: string; message_id: string; session_id: string; time_created: number | null; data: string },
-        [string, number]
-      >(
-        "SELECT id, message_id, session_id, time_created, data FROM part WHERE session_id = ? ORDER BY time_created ASC, id ASC LIMIT ?",
-      )
-      .all(sessionID, CONTEXT_CAP_SQL_ROWS + 1)
-    if (partRows.length > CONTEXT_CAP_SQL_ROWS) {
-      truncated = true
-      partRows.length = CONTEXT_CAP_SQL_ROWS
-    }
-
     for (const row of msgRows) {
-      bytes += utf8ByteLength(row.data)
-      if (bytes > CONTEXT_CAP_SQL_BYTES) {
+      const rowBytes = utf8ByteLength(row.data)
+      // Check-then-add: a row that would exceed the budget is DROPPED and must
+      // NOT consume the budget, so later (newer) parts can still be charged.
+      if (bytes + rowBytes > CONTEXT_CAP_SQL_BYTES) {
         truncated = true
         break
       }
+      bytes += rowBytes
       const data = parseDataJson(row.data)
       if (!data) continue
       const info: Record<string, unknown> = { id: row.id, sessionID: row.session_id, ...data }
@@ -225,21 +226,40 @@ export function readSessionMessagesFromSqlite(
       messages.push({ info, parts: [] })
       partsByMessage.set(row.id, messages[messages.length - 1].parts)
     }
+    messages.reverse()
 
-    if (!truncated) {
-      for (const row of partRows) {
-        const bucket = partsByMessage.get(row.message_id)
-        if (!bucket) continue
-        bytes += utf8ByteLength(row.data)
-        if (bytes > CONTEXT_CAP_SQL_BYTES) {
-          truncated = true
-          break
-        }
-        const data = parseDataJson(row.data)
-        if (!data) continue
-        bucket.push({ id: row.id, sessionID: row.session_id, messageID: row.message_id, ...data })
-      }
+    // Part rows: also recent tail (DESC), newest-first byte charge, always
+    // attached to retained messages (no `!truncated` guard).  Each part bucket
+    // is reversed to chronological order after admission.
+    const partRows = db
+      .query<
+        { id: string; message_id: string; session_id: string; time_created: number | null; data: string },
+        [string, number]
+      >(
+        "SELECT id, message_id, session_id, time_created, data FROM part WHERE session_id = ? ORDER BY time_created DESC, id DESC LIMIT ?",
+      )
+      .all(sessionID, CONTEXT_CAP_SQL_ROWS + 1)
+    if (partRows.length > CONTEXT_CAP_SQL_ROWS) {
+      truncated = true
+      partRows.length = CONTEXT_CAP_SQL_ROWS
     }
+    // Newest-first charging: byte pressure drops the oldest part rows first.
+    for (const row of partRows) {
+      const bucket = partsByMessage.get(row.message_id)
+      if (!bucket) continue
+      const rowBytes = utf8ByteLength(row.data)
+      // Check-then-add: a dropped part row never consumes the budget.
+      if (bytes + rowBytes > CONTEXT_CAP_SQL_BYTES) {
+        truncated = true
+        break
+      }
+      bytes += rowBytes
+      const data = parseDataJson(row.data)
+      if (!data) continue
+      bucket.push({ id: row.id, sessionID: row.session_id, messageID: row.message_id, ...data })
+    }
+    // Reverse each bucket to chronological order within the message.
+    for (const bucket of partsByMessage.values()) bucket.reverse()
 
     return { messages, truncated }
   } catch {

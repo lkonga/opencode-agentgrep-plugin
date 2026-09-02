@@ -116,6 +116,8 @@ export interface AgentGrepInput {
   // common options (file_type is the internal name; the public schema key is `type`)
   regex?: boolean
   file_type?: string
+  /** Public schema alias for `file_type` — normalized to `file_type` by pickAgentGrepInput. */
+  type?: string
   max_files?: number
   max_regions?: number
   max_items?: number
@@ -143,6 +145,81 @@ export interface AgentGrepInput {
    * zod schema and never surfaced through permission asks / results / metadata.
    */
   __contextJson?: string
+}
+
+/**
+ * STRICT allowlist of canonical PUBLIC schema keys the model may supply. This
+ * mirrors the public zod `args` surface exactly (jcode's parameters_schema):
+ *   mode, query, file, terms, regex, path, glob, type, max_files, max_regions, paths_only
+ *
+ * Reserved/internal keys are NEVER accepted from model input:
+ *   pattern, file_path, include, file_type, max_items, hidden, no_ignore,
+ *   full_region, debug_plan, debug_score, __fileScope, __contextJson
+ * Those exist only on the internal AgentGrepInput shape, set exclusively by
+ * trusted code (the execute layer / lower-level argv helpers). The model can
+ * reach them ONLY through their public aliases (`type` for `file_type`, `glob`
+ * for `include`, `file` for `file_path`, `query` for `pattern`).
+ */
+export const AGENTGREP_INPUT_ALLOWLIST = new Set([
+  "mode",
+  "query",
+  "file",
+  "terms",
+  "regex",
+  "path",
+  "glob",
+  "type",
+  "max_files",
+  "max_regions",
+  "paths_only",
+])
+
+/** The canonical public mode enum the model may pass. `smart` is internal. */
+const AGENTGREP_PUBLIC_MODES = new Set(["grep", "find", "outline", "trace"])
+
+/**
+ * Build a closed normalized AgentGrepInput from raw model-supplied input.
+ *
+ * Security contract:
+ *   - ONLY canonical public schema keys pass through (see AGENTGREP_INPUT_ALLOWLIST).
+ *   - EVERY reserved/internal key (`pattern`, `file_path`, `include`,
+ *     `file_type`, `max_items`, `hidden`, `no_ignore`, `full_region`,
+ *     `debug_plan`, `debug_score`, `__fileScope`, `__contextJson`, and unknown
+ *     keys) is discarded.
+ *   - Raw `mode: "smart"` is REJECTED (throw): the model-facing boundary accepts
+ *     public mode values (grep|find|outline|trace) only. `smart` remains usable
+ *     ONLY by lower-level trusted helpers (buildAgentGrepArgs /
+ *     operationPatterns / normalizeAgentGrepMode).
+ *   - Public `type` is mapped to the trusted internal `file_type`; raw
+ *     `file_type` is never accepted.
+ * Only trusted code may append `__fileScope`/`__contextJson` after canonical
+ * permission/context processing.
+ */
+export function pickAgentGrepInput(raw: Record<string, any>): AgentGrepInput {
+  const mode = raw.mode
+  if (mode !== undefined && mode !== null) {
+    if (mode === "smart") {
+      throw new Error(
+        `agentgrep: mode "smart" is an internal alias and cannot be passed by the model; use mode "trace" instead`,
+      )
+    }
+    if (!AGENTGREP_PUBLIC_MODES.has(mode)) {
+      throw new Error(`unknown agentgrep mode "${mode}" (expected grep|find|outline|trace)`)
+    }
+  }
+
+  const out: AgentGrepInput = {}
+  for (const key of AGENTGREP_INPUT_ALLOWLIST) {
+    const v = raw[key]
+    if (v !== undefined && v !== null) {
+      ;(out as any)[key] = v
+    }
+  }
+  // Public `type` → trusted internal `file_type` (raw `file_type` is discarded).
+  if (typeof raw.type === "string") {
+    out.file_type = raw.type
+  }
+  return out
 }
 
 /** Match-all glob forms that must mean "no filter" (jcode is_match_all_glob). */

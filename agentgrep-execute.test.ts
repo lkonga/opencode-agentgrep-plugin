@@ -21,6 +21,8 @@ import {
   askExternalDirectoryIfNeeded,
   AGENTGREP_DEFAULT_TIMEOUT_MS,
   AGENTGREP_DEFAULT_MAX_OUTPUT_CHARS,
+  compactGrepRegions,
+  GREP_DEFAULT_MAX_REGIONS,
 } from "./agentgrep-core"
 
 // ── Fake agentgrep CLI harness ───────────────────────────────────────────────
@@ -360,6 +362,374 @@ describe("ToolDefinition.execute smoke (fake agentgrep bin)", () => {
       if (prev === undefined) delete process.env.AGENTGREP_BIN
       else process.env.AGENTGREP_BIN = prev
       process.env.PATH = savedPath
+      fs.rmSync(ctx.directory, { recursive: true, force: true })
+    }
+  })
+})
+
+// ── Security remediation (host-integrated execute tests) ─────────────────────
+// Malicious model-supplied internal keys (__fileScope / __contextJson), public
+// `type` normalization, and leading-dash injection are exercised THROUGH
+// ToolDefinition.execute so argv, permission asks, and spawn behavior are all
+// proven end-to-end.
+
+describe("security remediation (execute-level)", () => {
+  const tools = buildAgentGrepTools()
+  const savedBin = process.env.AGENTGREP_BIN
+  const savedRecord = process.env.AG_RECORD
+
+  beforeAll(() => {
+    process.env.AGENTGREP_BIN = harness.bin
+    process.env.AG_RECORD = harness.record
+  })
+  afterAll(() => {
+    if (savedBin === undefined) delete process.env.AGENTGREP_BIN
+    else process.env.AGENTGREP_BIN = savedBin
+    if (savedRecord === undefined) delete process.env.AG_RECORD
+    else process.env.AG_RECORD = savedRecord
+  })
+
+  function lastArgv(): string[] {
+    const rec = readRecord(harness.record)
+    return rec[rec.length - 1] ?? []
+  }
+
+  test("malicious __fileScope cannot redirect argv outside canonical path processing", async () => {
+    const { ctx, asks } = makeCtx()
+    try {
+      fs.mkdirSync(path.join(ctx.directory, "src"), { recursive: true })
+      fs.writeFileSync(path.join(ctx.directory, "src", "a.ts"), "// a\n")
+      fs.writeFileSync(harness.record, "")
+      // Model smuggles an internal __fileScope pointing at an arbitrary root.
+      const res = asResult(
+        await tools.agentgrep.execute(
+          {
+            mode: "grep",
+            query: "auth",
+            path: "src/a.ts",
+            __fileScope: { root: "/etc", glob: "passwd" },
+          },
+          ctx,
+        ),
+      )
+      expect(res.metadata.ok).toBe(true)
+
+      const argv = lastArgv()
+      // The canonical scope for src/a.ts (parent + escaped basename) wins.
+      const pathIdx = argv.indexOf("--path")
+      expect(pathIdx).toBeGreaterThan(-1)
+      expect(argv[pathIdx + 1]).toBe(path.join(fs.realpathSync(ctx.directory), "src"))
+      expect(argv[argv.indexOf("--glob") + 1]).toBe("a.ts")
+      // The smuggled /etc scope never reaches argv.
+      expect(argv.join(" ")).not.toContain("/etc")
+      expect(argv.join(" ")).not.toContain("passwd")
+
+      // Permission asks were computed from the canonical in-project root.
+      expect(asks.some((a) => a.permission === "external_directory")).toBe(false)
+    } finally {
+      fs.rmSync(ctx.directory, { recursive: true, force: true })
+    }
+  })
+
+  test("malicious __fileScope cannot expose files outside ctx.directory (external file read)", async () => {
+    const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ag-sec-escope-")))
+    const proj = path.join(base, "proj")
+    const outside = path.join(base, "outside")
+    fs.mkdirSync(proj)
+    fs.mkdirSync(outside)
+    fs.writeFileSync(path.join(outside, "secrets.ts"), "PRIVATE=1\n")
+    try {
+      const { ctx } = makeCtx({ directory: proj, worktree: proj })
+      fs.writeFileSync(harness.record, "")
+      const res = asResult(
+        await tools.agentgrep.execute(
+          {
+            mode: "grep",
+            query: "auth",
+            path: ".",
+            __fileScope: { root: outside, glob: "secrets.ts" },
+          },
+          ctx,
+        ),
+      )
+      expect(res.metadata.ok).toBe(true)
+      const argv = lastArgv()
+      const pathIdx = argv.indexOf("--path")
+      // argv --path is the canonical in-project root, NOT the smuggled outside dir.
+      expect(argv[pathIdx + 1]).toBe(fs.realpathSync(proj))
+      expect(argv.join(" ")).not.toContain(fs.realpathSync(outside))
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true })
+    }
+  })
+
+  test("malicious __contextJson is discarded and never reaches argv", async () => {
+    const { ctx } = makeCtx()
+    try {
+      fs.mkdirSync(path.join(ctx.directory, "src"), { recursive: true })
+      fs.writeFileSync(path.join(ctx.directory, "src", "mod.ts"), "export function alpha() {}\n")
+      fs.writeFileSync(harness.record, "")
+      // A real trace execution WOULD add --context-json (internal temp file);
+      // the model-supplied path must never appear.
+      const res = asResult(
+        await tools.agentgrep.execute(
+          { mode: "trace", terms: ["subject:alpha"], __contextJson: "/etc/passwd" },
+          ctx,
+        ),
+      )
+      expect(res.metadata.ok).toBe(true)
+      const argv = lastArgv()
+      const cjIdx = argv.indexOf("--context-json")
+      // Either the trusted harness temp context (created in ctx tmp) or none —
+      // NEVER /etc/passwd.
+      if (cjIdx > -1) {
+        expect(argv[cjIdx + 1]).not.toBe("/etc/passwd")
+        expect(argv[cjIdx + 1]).not.toContain("etc")
+      }
+      expect(argv.join(" ")).not.toContain("/etc/passwd")
+    } finally {
+      fs.rmSync(ctx.directory, { recursive: true, force: true })
+    }
+  })
+
+  test("unknown model keys are discarded (never reach argv or affects), public type is normalized", async () => {
+    const { ctx } = makeCtx()
+    try {
+      fs.writeFileSync(harness.record, "")
+      const res = asResult(
+        await tools.agentgrep.execute(
+          { mode: "grep", query: "auth", type: "rs", bogusInternal: "x", hidden: true },
+          ctx,
+        ),
+      )
+      expect(res.metadata.ok).toBe(true)
+      const argv = lastArgv()
+      expect(argv[argv.indexOf("--type") + 1]).toBe("rs")
+      expect(argv.join(" ")).not.toContain("bogusInternal")
+    } finally {
+      fs.rmSync(ctx.directory, { recursive: true, force: true })
+    }
+  })
+
+  test("leading-dash query is argv-safe via `--` (no spawn of altered command)", async () => {
+    const { ctx, asks } = makeCtx()
+    try {
+      fs.writeFileSync(harness.record, "")
+      const res = asResult(
+        await tools.agentgrep.execute({ mode: "grep", query: "--regex", path: "." }, ctx),
+      )
+      expect(res.metadata.ok).toBe(true)
+      const argv = lastArgv()
+      // Query stayed a positional after `--`; it did not become a flag.
+      const dashIdx = argv.indexOf("--")
+      expect(dashIdx).toBeGreaterThan(-1)
+      expect(argv[argv.length - 1]).toBe("--regex")
+      // The permission pattern reflects the literal query.
+      const ask = asks.find((a) => a.permission === "agentgrep")
+      expect(ask!.patterns).toEqual(["--regex"])
+    } finally {
+      fs.rmSync(ctx.directory, { recursive: true, force: true })
+    }
+  })
+
+  test("leading-dash type value produces a friendly no-spawn result", async () => {
+    const { ctx } = makeCtx()
+    try {
+      fs.writeFileSync(harness.record, "")
+      const res = asResult(await tools.agentgrep.execute({ mode: "grep", query: "auth", type: "-rs" }, ctx))
+      expect(res.metadata.ok).toBe(false)
+      expect(res.output).toContain("invalid arguments")
+      expect(readRecord(harness.record)).toEqual([])
+    } finally {
+      fs.rmSync(ctx.directory, { recursive: true, force: true })
+    }
+  })
+
+  test("leading-dash glob value produces a friendly no-spawn result", async () => {
+    const { ctx } = makeCtx()
+    try {
+      fs.writeFileSync(harness.record, "")
+      const res = asResult(await tools.agentgrep.execute({ mode: "grep", query: "auth", glob: "--evil" }, ctx))
+      expect(res.metadata.ok).toBe(false)
+      expect(res.output).toContain("invalid arguments")
+      expect(readRecord(harness.record)).toEqual([])
+    } finally {
+      fs.rmSync(ctx.directory, { recursive: true, force: true })
+    }
+  })
+
+  test("exact-file path with glob metachars in the filename stays contained (escaped scope)", async () => {
+    const { ctx } = makeCtx()
+    try {
+      fs.mkdirSync(path.join(ctx.directory, "src"), { recursive: true })
+      // Adversarial siblings: a1.ts could match a raw `a*.ts` glob.
+      fs.writeFileSync(path.join(ctx.directory, "src", "a*.ts"), "export function auth_status() {}\n")
+      fs.writeFileSync(path.join(ctx.directory, "src", "a1.ts"), "export function auth_status() {}\n")
+      fs.writeFileSync(harness.record, "")
+      const res = asResult(
+        await tools.agentgrep.execute({ mode: "grep", query: "auth_status", path: "src/a*.ts" }, ctx),
+      )
+      expect(res.metadata.ok).toBe(true)
+      const argv = lastArgv()
+      const pathIdx = argv.indexOf("--path")
+      expect(argv[pathIdx + 1]).toBe(path.join(fs.realpathSync(ctx.directory), "src"))
+      // Basename is glob-escaped: only the literal `a*.ts` can match.
+      expect(argv[argv.indexOf("--glob") + 1]).toBe("a\\*.ts")
+    } finally {
+      fs.rmSync(ctx.directory, { recursive: true, force: true })
+    }
+  })
+
+  // ── Reserved internal keys are inert through execute (blocker follow-up) ──
+  // Prove every reserved/internal key passed by the model is discarded before
+  // any permission ask, metadata, or provider/context work, and can never
+  // alter argv, asks, or external access.
+
+  test("raw mode \"smart\" is rejected through execute (no-spawn friendly result, before any ask)", async () => {
+    const { ctx, asks } = makeCtx()
+    try {
+      fs.writeFileSync(harness.record, "")
+      const res = asResult(await tools.agentgrep.execute({ mode: "smart", query: "x" }, ctx))
+      expect(res.metadata.ok).toBe(false)
+      expect(res.output).toMatch(/internal alias|smart.*invalid|invalid arguments/i)
+      // No spawn (fake bin never ran) AND no permission ask was issued: the
+      // closed public-only input is built before any permission/metadata work.
+      expect(readRecord(harness.record)).toEqual([])
+      expect(asks).toHaveLength(0)
+    } finally {
+      fs.rmSync(ctx.directory, { recursive: true, force: true })
+    }
+  })
+
+  test("every reserved internal key is inert through execute (argv, asks, metadata unaffected)", async () => {
+    const { ctx, asks } = makeCtx()
+    try {
+      fs.writeFileSync(harness.record, "")
+
+      // Pass EVERY reserved/internal key alongside a valid public-only call.
+      // None should reach argv, permission asks, or metadata.
+      const res = asResult(
+        await tools.agentgrep.execute(
+          {
+            mode: "grep",
+            query: "auth",
+            path: "src",
+            // Reserved/internal keys — all must be discarded:
+            pattern: "internal-pattern-should-not-appear",
+            file_path: "internal-file-path-should-not-appear",
+            include: "*.internal-include-should-not-appear",
+            file_type: "internal-file-type-should-not-appear",
+            max_items: 999,
+            hidden: true,
+            no_ignore: true,
+            full_region: "always",
+            debug_plan: true,
+            debug_score: true,
+            __fileScope: { root: "/etc", glob: "passwd" },
+            __contextJson: "/etc/passwd",
+            unknownKey: "must-be-dropped",
+          },
+          ctx,
+        ),
+      )
+      expect(res.metadata.ok).toBe(true)
+
+      const argv = lastArgv()
+      // The argv must contain ONLY the public-mode subcommand + public query + public --path.
+      // No --type, --hidden, --no-ignore, --glob with internal patterns, etc.
+      expect(argv[0]).toBe("grep")
+      expect(argv[1]).toBe("auth")
+      expect(argv[argv.indexOf("--path") + 1]).toContain("src")
+      // Forbidden flags/proofs:
+      expect(argv).not.toContain("--type")
+      expect(argv).not.toContain("--hidden")
+      expect(argv).not.toContain("--no-ignore")
+      expect(argv).not.toContain("--glob")
+      expect(argv).not.toContain("--max-items")
+      expect(argv).not.toContain("--full-region")
+      expect(argv).not.toContain("--debug-plan")
+      expect(argv).not.toContain("--debug-score")
+      // The smuggled __fileScope/__contextJson must never reach argv.
+      expect(argv.join(" ")).not.toContain("/etc")
+      expect(argv.join(" ")).not.toContain("passwd")
+      expect(argv.join(" ")).not.toContain("internal")
+      expect(argv.join(" ")).not.toContain("unknownKey")
+
+      // Permission ask metadata must NOT include the internal keys.
+      const ask = asks.find((a) => a.permission === "agentgrep")
+      expect(ask!.metadata.include).toBeUndefined() // no include smuggled
+      // The ask patterns must be the public query, not the internal pattern.
+      expect(ask!.patterns).toEqual(["auth"])
+
+      // No external_directory ask was triggered (the smuggled __fileScope
+      // pointing at /etc must not have been used for root resolution).
+      expect(asks.some((a) => a.permission === "external_directory")).toBe(false)
+    } finally {
+      fs.rmSync(ctx.directory, { recursive: true, force: true })
+    }
+  })
+
+  test("reserved alias file_path cannot substitute for public file (outline mode)", async () => {
+    const { ctx } = makeCtx()
+    try {
+      fs.writeFileSync(harness.record, "")
+      // file_path alone (no public file) → no outline file → invalid arguments.
+      const res = asResult(await tools.agentgrep.execute({ mode: "outline", file_path: "a.ts" }, ctx))
+      expect(res.metadata.ok).toBe(false)
+      expect(res.output).toContain("invalid arguments")
+      expect(readRecord(harness.record)).toEqual([])
+    } finally {
+      fs.rmSync(ctx.directory, { recursive: true, force: true })
+    }
+  })
+
+  test("reserved alias pattern cannot substitute for public query (grep mode)", async () => {
+    const { ctx } = makeCtx()
+    try {
+      fs.writeFileSync(harness.record, "")
+      // pattern alone (no public query) → no query → invalid arguments.
+      const res = asResult(await tools.agentgrep.execute({ mode: "grep", pattern: "auth" }, ctx))
+      expect(res.metadata.ok).toBe(false)
+      expect(res.output).toContain("invalid arguments")
+      expect(readRecord(harness.record)).toEqual([])
+    } finally {
+      fs.rmSync(ctx.directory, { recursive: true, force: true })
+    }
+  })
+
+  test("reserved alias include cannot substitute for public glob (find scoped-only)", async () => {
+    const { ctx, asks } = makeCtx()
+    try {
+      fs.writeFileSync(harness.record, "")
+      // include alone (no public glob, no terms): the include key is INERT.
+      // Execute threads the canonical project path, so the find runs as an
+      // UNFILTERED project-wide find — it must NOT receive a --glob from
+      // include, and the ask metadata must not carry the include value.
+      const res = asResult(await tools.agentgrep.execute({ mode: "find", include: "*.ts" }, ctx))
+      expect(res.metadata.ok).toBe(true)
+      const argv = lastArgv()
+      expect(argv[0]).toBe("find")
+      expect(argv).not.toContain("--glob")
+      expect(argv.join(" ")).not.toContain("*.ts")
+      const ask = asks.find((a) => a.permission === "agentgrep")
+      expect(ask!.metadata.include).toBeUndefined()
+    } finally {
+      fs.rmSync(ctx.directory, { recursive: true, force: true })
+    }
+  })
+
+  test("reserved alias file_type cannot produce --type argv (model must use public type)", async () => {
+    const { ctx } = makeCtx()
+    try {
+      fs.writeFileSync(harness.record, "")
+      const res = asResult(
+        await tools.agentgrep.execute({ mode: "grep", query: "auth", file_type: "rs" }, ctx),
+      )
+      expect(res.metadata.ok).toBe(true)
+      const argv = lastArgv()
+      expect(argv).not.toContain("--type")
+      expect(argv.join(" ")).not.toContain("rs")
+    } finally {
       fs.rmSync(ctx.directory, { recursive: true, force: true })
     }
   })
@@ -817,5 +1187,224 @@ smoke(smokeLabel, () => {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }
+  })
+
+  test("exact-file scope with glob metacharacters contains to the literal file (adversarial siblings)", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ag-smoke-globesc-"))
+    try {
+      // `a*.ts` is a literal filename; `a1.ts` is an adversarial sibling that a
+      // RAW `a*.ts` glob would also match. Both contain the same hit so an
+      // uncontained search would report 2 files.
+      const target = path.join(dir, "a*.ts")
+      const sibling = path.join(dir, "a1.ts")
+      fs.writeFileSync(target, "export function auth_status() {}\n")
+      fs.writeFileSync(sibling, "export function auth_status() {}\n")
+      const scope = exactFileScope(target, "file")
+      const argv = buildAgentGrepArgs({ mode: "grep", query: "auth_status", path: target, __fileScope: scope! })
+      expect(scope!.glob).toBe("a\\*.ts")
+      const res = await runAgentGrep(argv, { bin: smokeBin!, cwd: dir })
+      expect(res.exit).toBe(0)
+      expect(res.stdout).toContain("a*.ts")
+      expect(res.stdout).not.toContain("a1.ts")
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("exact-file scope with brackets/braces/backslash contains to the literal file", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ag-smoke-globesc2-"))
+    try {
+      const names = ["a[1].ts", "a{b}.ts", "a\\b.ts"]
+      for (const name of names) {
+        fs.writeFileSync(path.join(dir, name), "export function auth_status() {}\n")
+      }
+      // Adversarial siblings for each pattern.
+      fs.writeFileSync(path.join(dir, "a1.ts"), "export function auth_status() {}\n")
+      fs.writeFileSync(path.join(dir, "ab.ts"), "export function auth_status() {}\n")
+      for (const name of names) {
+        const target = path.join(dir, name)
+        const scope = exactFileScope(target, "file")
+        const argv = buildAgentGrepArgs({ mode: "grep", query: "auth_status", path: target, __fileScope: scope! })
+        const res = await runAgentGrep(argv, { bin: smokeBin!, cwd: dir })
+        expect(res.exit).toBe(0)
+        expect(res.stdout).toContain(name)
+      }
+      // The adversarial siblings must NOT appear in any single-file scope run.
+      const one = exactFileScope(path.join(dir, "a[1].ts"), "file")!
+      const argv = buildAgentGrepArgs({ mode: "grep", query: "auth_status", path: path.join(dir, "a[1].ts"), __fileScope: one })
+      const res = await runAgentGrep(argv, { bin: smokeBin!, cwd: dir })
+      expect(res.stdout).not.toContain("a1.ts")
+      expect(res.stdout).not.toContain("ab.ts")
+      expect(res.stdout).not.toContain("a{b}.ts")
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("leading-dash query stays a literal positional via `--` (no flag reinterpretation)", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ag-smoke-dash-"))
+    try {
+      fs.writeFileSync(path.join(dir, "a.ts"), "// --regex appears here\n")
+      const argv = buildAgentGrepArgs({ mode: "grep", query: "--regex", path: dir })
+      expect(argv).toContain("--")
+      const res = await runAgentGrep(argv, { bin: smokeBin!, cwd: dir })
+      expect(res.exit).toBe(0)
+      expect(res.stdout).toContain("a.ts")
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("public `type` is normalized and accepted by the real CLI", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ag-smoke-type-"))
+    try {
+      fs.writeFileSync(path.join(dir, "a.ts"), "export function auth_status() {}\n")
+      fs.writeFileSync(path.join(dir, "b.md"), "export function auth_status() {}\n")
+      const argv = buildAgentGrepArgs({ mode: "grep", query: "auth_status", type: "ts", path: dir })
+      expect(argv).toContain("--type")
+      expect(argv[argv.indexOf("--type") + 1]).toBe("ts")
+      const res = await runAgentGrep(argv, { bin: smokeBin!, cwd: dir })
+      expect(res.exit).toBe(0)
+      expect(res.stdout).toContain("a.ts")
+      expect(res.stdout).not.toContain("b.md")
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+// ── grep result-level region cap (item 5) ─────────────────────────────────────
+// AgentGrep v0.1.6 grep accepts NO --max-regions flag, so the public
+// max_regions controls a post-execution result cap (omitted → 200) applied
+// ONLY to grep stdout. No buffering/spawn changes: the exec layer already
+// captures bounded output; the fake CLI proves the argv has no new flag.
+
+describe("grep result-level region cap (post-exec, no CLI flag)", () => {
+  const tools = buildAgentGrepTools()
+  const savedBin = process.env.AGENTGREP_BIN
+  const savedRecord = process.env.AG_RECORD
+  let manyBin = ""
+  let record = ""
+
+  beforeAll(() => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ag-cap-"))
+    record = path.join(dir, "record.txt")
+    manyBin = writeBin(
+      dir,
+      "agentgrep-many",
+      `
+printf '%s\\n' "$(printf '%s\\t' "$@")" >> "\${AG_RECORD:-/dev/null}"
+mode="$1"
+i=0
+while [ $i -lt 500 ]; do
+  if [ "$mode" = "grep" ]; then
+    printf 'file%d.ts:%d:1: auth region %d\\n' "$i" "$((i % 50 + 1))" "$i"
+  else
+    echo "file$i.ts"
+  fi
+  i=$((i + 1))
+done
+`,
+    )
+    process.env.AGENTGREP_BIN = manyBin
+    process.env.AG_RECORD = record
+  })
+
+  afterAll(() => {
+    if (savedBin === undefined) delete process.env.AGENTGREP_BIN
+    else process.env.AGENTGREP_BIN = savedBin
+    if (savedRecord === undefined) delete process.env.AG_RECORD
+    else process.env.AG_RECORD = savedRecord
+    fs.rmSync(path.dirname(record), { recursive: true, force: true })
+  })
+
+  function lastArgv(): string[] {
+    const rec = readRecord(record)
+    return rec[rec.length - 1] ?? []
+  }
+
+  function countRegions(out: string): number {
+    return out.split("\n").filter((l) => /^[^:\n]+:\d+:/.test(l)).length
+  }
+
+  test("grep with public max_regions caps the RESULT (and never the argv)", async () => {
+    const { ctx, asks } = makeCtx()
+    try {
+      fs.writeFileSync(record, "")
+      const res = asResult(await tools.agentgrep.execute({ mode: "grep", query: "auth", max_regions: 3 }, ctx))
+      expect(res.metadata.ok).toBe(true)
+      expect(res.metadata.regionsCapped).toBe(true)
+      expect(res.metadata.regions).toBe(500)
+      expect(res.metadata.maxRegions).toBe(3)
+      expect(countRegions(res.output)).toBeLessThanOrEqual(3)
+      expect(res.output).toContain("results truncated to 3 regions")
+      // The CLI must never receive --max-regions (v0.1.6 grep rejects it).
+      const argv = lastArgv()
+      expect(argv[0]).toBe("grep")
+      expect(argv).not.toContain("--max-regions")
+      expect(asks.find((a) => a.permission === "agentgrep")).toBeTruthy()
+    } finally {
+      fs.rmSync(ctx.directory, { recursive: true, force: true })
+    }
+  })
+
+  test("grep default cap is 200 when max_regions is omitted", async () => {
+    const { ctx } = makeCtx()
+    try {
+      fs.writeFileSync(record, "")
+      const capped = asResult(await tools.agentgrep.execute({ mode: "grep", query: "auth" }, ctx))
+      expect(capped.metadata.ok).toBe(true)
+      expect(capped.metadata.regionsCapped).toBe(true)
+      expect(capped.metadata.maxRegions).toBe(200)
+      expect(countRegions(capped.output)).toBeLessThanOrEqual(200)
+      expect(capped.output).toContain("max_regions=200")
+      const argv = lastArgv()
+      expect(argv).not.toContain("--max-regions")
+    } finally {
+      fs.rmSync(ctx.directory, { recursive: true, force: true })
+    }
+  })
+
+  test("later grep with a generous max_regions does not cap (under limit)", async () => {
+    const { ctx } = makeCtx()
+    try {
+      fs.writeFileSync(record, "")
+      const res = asResult(await tools.agentgrep.execute({ mode: "grep", query: "auth", max_regions: 1000 }, ctx))
+      expect(res.metadata.ok).toBe(true)
+      expect(res.metadata.regionsCapped).toBeUndefined()
+      expect(countRegions(res.output)).toBe(500)
+    } finally {
+      fs.rmSync(ctx.directory, { recursive: true, force: true })
+    }
+  })
+
+  test("non-grep modes are NEVER compacted (find passthrough with max_regions)", async () => {
+    const { ctx } = makeCtx()
+    try {
+      fs.writeFileSync(record, "")
+      const res = asResult(await tools.agentgrep.execute({ mode: "find", query: "auth", max_regions: 3 }, ctx))
+      expect(res.metadata.ok).toBe(true)
+      expect(res.metadata.regionsCapped).toBeUndefined()
+      // All 500 lines pass through untouched — no truncation note, no cap.
+      expect(res.output.split("\n").filter(Boolean).length).toBe(500)
+      expect(res.output).not.toContain("truncated to")
+    } finally {
+      fs.rmSync(ctx.directory, { recursive: true, force: true })
+    }
+  })
+
+  test("pure compactGrepRegions: cap binds only above the limit, headers kept, note truthful", () => {
+    const many = Array.from({ length: 300 }, (_, i) => `f${i}.ts:${i + 1}:1: hit`).join("\n")
+    const withHeader = `top files: 300\n${many}`
+    const capped = compactGrepRegions(withHeader, 5)
+    expect(capped.capped).toBe(true)
+    expect(capped.regions).toBe(300)
+    expect(capped.text).toContain("top files: 300")
+    expect(countRegions(capped.text)).toBe(5)
+    expect(capped.text).toContain("results truncated to 5 regions")
+    // Under the limit → byte-for-byte untouched.
+    const small = "a.ts:1:1: x\nb.ts:2:1: y\n"
+    expect(compactGrepRegions(small, 200)).toEqual({ text: small, regions: 2, capped: false })
+    expect(GREP_DEFAULT_MAX_REGIONS).toBe(200)
   })
 })

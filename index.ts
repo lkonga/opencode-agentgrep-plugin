@@ -23,6 +23,14 @@
 // preserving unrelated tool settings. `replaceNativeSearch:false` is the
 // explicit portable opt-out.
 //
+// Security: The config HOOK now applies an AUTHORITATIVE "deny" permission
+// policy at BOTH the global config.permission level AND every explicitly
+// configured agent's permission block (see agentgrep-policy.ts). This ensures
+// grep/glob are excluded from model-request tool payloads even though the
+// built-in tool registry always advertises them through /experimental/tool.
+// The legacy `config.tools.grep = false` / `config.tools.glob = false` is
+// preserved as a secondary guard.
+//
 // System guidance: the `experimental.chat.system.transform` hook appends an
 // idempotent, LOCAL-only code-search hint (use `agentgrep` for exact/find/
 // outline/trace; never find/grep/glob/Grep/file_grep;
@@ -38,6 +46,7 @@ import {
   buildAgentGrepTools,
   sanitizeAgentGrepPluginOptions,
 } from "./agentgrep-core"
+import { applyAgentGrepPolicy } from "./agentgrep-policy"
 
 export default (async (input: PluginInput, options?: unknown) => {
   const resolvedOptions = sanitizeAgentGrepPluginOptions(options)
@@ -45,9 +54,7 @@ export default (async (input: PluginInput, options?: unknown) => {
   return {
     config: async (config) => {
       if (!resolvedOptions.replaceNativeSearch) return
-      config.tools ??= {}
-      config.tools.grep = false
-      config.tools.glob = false
+      applyAgentGrepPolicy(config as Record<string, any>)
     },
     tool: buildAgentGrepTools(input, resolvedOptions),
     "experimental.chat.system.transform": async (_input, output) => {
