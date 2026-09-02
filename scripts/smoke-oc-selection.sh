@@ -11,17 +11,23 @@
 # is unset the script SKIPS (exit 2) with a clear message.
 #
 # What it proves (TWO sequential oc runs):
-#   1. Run 1 (exact grep): the ONLY code-search tool_use is canonical `agentgrep`
-#      with mode=grep (or omitted default) and query/pattern `passthroughStream`.
-#   2. Run 2 (ranked find): the ONLY code-search tool_use is canonical `agentgrep`
-#      with mode=find and relevant discovery terms (e.g. "session store").
-#   3. No bare `find`, `grep`, `glob`, `Grep`, `file_grep`, or `callmux*` tool use
-#      in either run.
-#   4. The controlled fake agentgrep binary is invoked EXACTLY ONCE per run with
-#      the correct subcommand (grep / find).
-#   5. The expected result reaches the model in each run.
-#   6. Pass does NOT rely on injecting tools.grep/tools.glob in OPENCODE_CONFIG_CONTENT
-#      — the plugin's config hook performs the replacement automatically.
+#   1. Run 1 (exact grep): at least one code-search tool_use and EVERY one is
+#      canonical `agentgrep` with explicit mode=grep — at least one
+#      call carries query/pattern `passthroughStream`.
+#   2. Run 2 (ranked find): at least one code-search tool_use and EVERY one is
+#      canonical `agentgrep` with mode=find — at least one call carries relevant
+#      discovery terms (e.g. "session store").
+#   3. No bare `find`, `grep`, `glob`, `Grep`, `file_grep`, or `callmux*` tool
+#      use in either run (explicit failure).
+#   4. The controlled fake agentgrep binary is invoked at least once and at most
+#      OC_SMOKE_MAX_CALLS (default 8) times per run, and EVERY invocation
+#      subcommand matches the phase (grep / find).
+#   5. Local-search calls per run are bounded (<= OC_SMOKE_MAX_CALLS, default 8)
+#      as a deterministic loop sanity check. Unrelated read/bash calls do not
+#      affect this policy assertion.
+#   6. The expected result reaches the model in each run.
+#   7. Pass does not rely on config-level native-tool disables; the plugin's
+#      replacement policy and event-stream assertions remain authoritative.
 #
 # Host-environment notes:
 #   - Uses a CONTROLLED FAKE agentgrep binary via AGENTGREP_BIN.
@@ -50,6 +56,20 @@ if ! command -v "$OC" >/dev/null 2>&1; then
   echo "ERROR: '$OC' (OC, optional override via \$OC) not found on PATH." >&2
   exit 1
 fi
+
+# ── Bounded-call sanity check ────────────────────────────────────────────
+MAX_CALLS="${OC_SMOKE_MAX_CALLS:-8}"
+case "$MAX_CALLS" in
+  ''|*[!0-9]*)
+    echo "ERROR: OC_SMOKE_MAX_CALLS='$OC_SMOKE_MAX_CALLS' must be a positive integer." >&2
+    exit 1
+    ;;
+esac
+if [[ "$MAX_CALLS" -lt 1 ]]; then
+  echo "ERROR: OC_SMOKE_MAX_CALLS='$MAX_CALLS' must be >= 1." >&2
+  exit 1
+fi
+echo "  [config] MAX_CALLS=$MAX_CALLS (set OC_SMOKE_MAX_CALLS to change)" >&2
 
 # ── Sandbox (removed on exit) ────────────────────────────────────────────────
 SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/oc-smoke-selection.XXXXXX")"
@@ -100,15 +120,11 @@ exit 0
 SCRIPT
 chmod +x "$FAKE_BIN"
 
-# ── Inject only this plugin (no tools.grep/tools.glob); config hook does it ──
-export OPENCODE_CONFIG_CONTENT="$(
-  printf '{"plugin":["file://%s"]}' "$PLUGIN_DIR"
-)"
+# ── Inject only this plugin; its config hook applies native-tool replacement ─
+export OPENCODE_CONFIG_CONTENT="$(printf '{"plugin":["file://%s"]}' "$PLUGIN_DIR")"
 export OPENCODE_PERMISSION='{"agentgrep":"allow","external_directory":"allow"}'
 export OPENCODE_SHARED_SERVER=0
-# Ignore any project-scoped config (.opencode/) so the pass is host-config
-# independent. This only disables PROJECT config — user/global config (where
-# model auth lives) is still read, so OC_SMOKE_MODEL keeps working.
+# Ignore repository/project config while retaining user/global model auth.
 export OPENCODE_DISABLE_PROJECT_CONFIG=1
 
 export TMPDIR="$TMPSTATE"
@@ -229,7 +245,7 @@ run_oc() {
   # Parse the event stream.
   if command -v python3 >/dev/null 2>&1; then
     python3 - "$events_out" >"$verdict_out" <<'PY'
-import json, sys
+import json, re, sys
 
 def tool_parts():
     for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
@@ -260,14 +276,24 @@ for part in tool_parts():
 
 tools_used = [last_by_id[p][0] for p in order]
 agentgrep_input = None
+agentgrep_all: list[dict] = []
 for p in order:
     tool, inp = last_by_id[p]
     if tool == "agentgrep":
         agentgrep_input = inp
+        agentgrep_all.append({"tool": tool, "input": inp})
 
 code_search = ["agentgrep", "find", "grep", "Grep", "file_grep", "glob"]
 used_code_search = [t for t in tools_used if t in code_search]
 callmux = [t for t in tools_used if t and "callmux" in t.lower()]
+# Explicit banned-set: bare find/grep/glob/Grep/file_grep or ANY callmux* tool.
+banned_found = [t for t in tools_used if t in ("find", "grep", "glob", "Grep", "file_grep") or (t and "callmux" in t.lower())]
+shell_search = []
+for p in order:
+    tool, inp = last_by_id[p]
+    command = inp.get("command") if tool == "bash" and isinstance(inp, dict) else None
+    if isinstance(command, str) and re.search(r"(?:^|[\s;&|])(?:rg|grep|find)(?=\s|$)", command):
+        shell_search.append("bash")
 
 # Final assistant text: the LAST text part (streaming accumulates the full text).
 final_text = ""
@@ -290,7 +316,10 @@ for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
 print("TOOLS_USED=" + ",".join(tools_used))
 print("CODESEARCH_USED=" + ",".join(used_code_search))
 print("CALLMUX_USED=" + ",".join(callmux))
+print("BANNED_CODE_SEARCH=" + ",".join(sorted(set(banned_found))))
+print("BANNED_SHELL_SEARCH=" + ",".join(shell_search))
 print("AGENTGREP_INPUT=" + json.dumps(agentgrep_input))
+print("AGENTGREP_CALLS=" + "|||".join(json.dumps(c) for c in agentgrep_all))
 print("FINAL_TEXT=" + final_text.replace("\n", " "))
 PY
   else
@@ -346,38 +375,69 @@ run_oc "grep" "$PROMPT_GREP" "$EVENTS_GREP" "$VERDICT_GREP"
 TOOLS_USED="$(verdict TOOLS_USED "$VERDICT_GREP")"
 CODESEARCH_USED="$(verdict CODESEARCH_USED "$VERDICT_GREP")"
 CALLMUX_USED="$(verdict CALLMUX_USED "$VERDICT_GREP")"
+BANNED_CODE_SEARCH="$(verdict BANNED_CODE_SEARCH "$VERDICT_GREP")"
+BANNED_SHELL_SEARCH="$(verdict BANNED_SHELL_SEARCH "$VERDICT_GREP")"
 AGENTGREP_INPUT="$(verdict AGENTGREP_INPUT "$VERDICT_GREP")"
+AGENTGREP_CALLS="$(verdict AGENTGREP_CALLS "$VERDICT_GREP")"
 FINAL_TEXT="$(verdict FINAL_TEXT "$VERDICT_GREP")"
 
-# 1a. Exactly one code-search tool_use and it is canonical agentgrep.
-[[ "$CODESEARCH_USED" == "agentgrep" ]] || fail "[grep] expected ONLY agentgrep as code-search tool use, got: $CODESEARCH_USED (all tools: $TOOLS_USED)"
+# 1a. At least one local code-search call in this phase, and EVERY code-search
+# call must be canonical `agentgrep` (multi-call runs pass as long as every call
+# is canonical agentgrep).
+code_search_count=0
+non_canonical_cs=""
+IFS=',' read -ra cs_tools <<< "$CODESEARCH_USED"
+for cs_tool in "${cs_tools[@]}"; do
+  if [[ -n "$cs_tool" ]]; then
+    code_search_count=$((code_search_count + 1))
+    if [[ "$cs_tool" != "agentgrep" ]]; then
+      non_canonical_cs="$non_canonical_cs,$cs_tool"
+    fi
+  fi
+done
+[[ "$code_search_count" -ge 1 ]] || fail "[grep] no local code-search call detected (expected >=1 canonical agentgrep call)"
+[[ "$code_search_count" -le "$MAX_CALLS" ]] || fail "[grep] local code-search calls $code_search_count exceed MAX_CALLS=$MAX_CALLS (run looks unbounded)"
+[[ -z "$non_canonical_cs" ]] || fail "[grep] every code-search call must be canonical agentgrep; found non-canonical: ${non_canonical_cs#,} (all: $CODESEARCH_USED)"
 
-# 3. No callmux tool/result retrieval.
+# 2a. Explicit fail on bare find/grep/glob/Grep/file_grep or any callmux usage.
+[[ -z "$BANNED_CODE_SEARCH" ]] || fail "[grep] banned code-search tool(s) used: $BANNED_CODE_SEARCH (all tools: $TOOLS_USED)"
+[[ -z "$BANNED_SHELL_SEARCH" ]] || fail "[grep] shell-based local search bypassed canonical agentgrep: $BANNED_SHELL_SEARCH"
 [[ -z "$CALLMUX_USED" ]] || fail "[grep] callmux tool/result retrieval occurred: $CALLMUX_USED"
 
-# 2a. Input is grep mode with query/pattern passthroughStream.
-MODE_OK=0
-case "$AGENTGREP_INPUT" in
-  *passthroughStream*)
-    case "$AGENTGREP_INPUT" in
-      *'"mode": "grep"'*|*'"mode":"grep"'*|*"mode: grep"*) MODE_OK=1 ;;
-      *) MODE_OK=0 ;;
-    esac
-    # Accept an explicit mode "grep" OR no mode at all (defaults to grep).
-    if [[ "$MODE_OK" -ne 1 ]]; then
-      if [[ "$AGENTGREP_INPUT" != *'"mode"'* && "$AGENTGREP_INPUT" != *"mode:"* ]]; then
-        MODE_OK=1
-      fi
-    fi
-    ;;
-esac
-[[ "$MODE_OK" -eq 1 ]] || fail "[grep] agentgrep input not grep mode / passthroughStream: $AGENTGREP_INPUT"
+# 3a. EVERY canonical call must explicitly use the phase's required grep mode;
+# AT LEAST ONE call must carry the phase's expected query.
+ag_call_count=0
+ag_mode_bad=0
+ag_query_ok=0
+IFS='|||' read -ra ag_calls <<< "$AGENTGREP_CALLS"
+for ac in "${ag_calls[@]}"; do
+  [[ -z "$ac" ]] && continue
+  ag_call_count=$((ag_call_count + 1))
+  if [[ "$ac" != *'"mode": "grep"'* && "$ac" != *'"mode":"grep"'* && "$ac" != *'mode: grep'* ]]; then
+    ag_mode_bad=1
+  fi
+  if [[ "$ac" == *"passthroughStream"* ]]; then
+    ag_query_ok=$((ag_query_ok + 1))
+  fi
+done
+[[ "$ag_call_count" -ge 1 ]] || fail "[grep] no agentgrep call input captured for mode/query validation"
+[[ "$ag_mode_bad" -eq 0 ]] || fail "[grep] at least one agentgrep call does not use the phase's required grep mode: $AGENTGREP_CALLS"
+[[ "$ag_query_ok" -ge 1 ]] || fail "[grep] no agentgrep call carries the phase's expected query 'passthroughStream': $AGENTGREP_CALLS"
 
-# 4a. Fake binary invoked EXACTLY once, in grep subcommand.
-INVOCATIONS="$(grep -c '^\[ARGV\]' "$RECORD" 2>/dev/null || true)"
-[[ "$INVOCATIONS" -eq 1 ]] || fail "[grep] fake agentgrep binary invoked $INVOCATIONS times (expected exactly 1)"
-grep -q '^\[ARGV\]	grep	' "$RECORD" || fail "[grep] fake invocation was not grep subcommand: $(grep '^\[ARGV\]' "$RECORD" | redact | head -n1)"
-grep -q 'passthroughStream' "$RECORD" || fail "[grep] fake invocation did not pass passthroughStream"
+# 4a. Fake CLI: recorded invocations >=1 and <= MAX_CALLS; EVERY invocation
+# subcommand must match the phase (grep).
+INVOCATIONS=0
+grep_sub=0
+while IFS= read -r invline; do
+  [[ -z "$invline" ]] && continue
+  INVOCATIONS=$((INVOCATIONS + 1))
+  case "$invline" in
+    $'[ARGV]\tgrep\t'*) grep_sub=$((grep_sub + 1)) ;;
+  esac
+done < <(grep '^\[ARGV\]' "$RECORD" 2>/dev/null || true)
+[[ "$INVOCATIONS" -ge 1 && "$INVOCATIONS" -le "$MAX_CALLS" ]] || fail "[grep] fake agentgrep binary invoked $INVOCATIONS times (expected >=1, <=$MAX_CALLS)"
+[[ "$grep_sub" -eq "$INVOCATIONS" ]] || fail "[grep] only $grep_sub of $INVOCATIONS fake invocations used 'grep' subcommand (every invocation must match phase): $(grep '^\[ARGV\]' "$RECORD" | redact | paste -sd';' -)"
+grep -q 'passthroughStream' "$RECORD" || fail "[grep] fake invocation did not pass passthroughStream: $(grep '^\[ARGV\]' "$RECORD" | redact | head -n3)"
 
 # 5a. Expected result reached the model (final assistant text references it).
 case "$FINAL_TEXT" in
@@ -386,7 +446,7 @@ case "$FINAL_TEXT" in
   *) fail "[grep] expected result did not reach the model final text: $FINAL_TEXT" ;;
 esac
 
-echo "  [grep] PASS: exact lexical search selected canonical agentgrep, no bare grep/find/glob/Grep/file_grep/callmux, fake invoked once, 19-matches-across-6-files result reached the model." >&2
+echo "  [grep] PASS: $code_search_count agentgrep call(s) (all canonical, grep mode, <=$MAX_CALLS), $INVOCATIONS phase-matching fake invocation(s), 19-matches-across-6-files result reached the model." >&2
 echo "  [grep] tool uses: $TOOLS_USED" >&2
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -399,34 +459,70 @@ run_oc "find" "$PROMPT_FIND" "$EVENTS_FIND" "$VERDICT_FIND"
 TOOLS_USED="$(verdict TOOLS_USED "$VERDICT_FIND")"
 CODESEARCH_USED="$(verdict CODESEARCH_USED "$VERDICT_FIND")"
 CALLMUX_USED="$(verdict CALLMUX_USED "$VERDICT_FIND")"
+BANNED_CODE_SEARCH="$(verdict BANNED_CODE_SEARCH "$VERDICT_FIND")"
+BANNED_SHELL_SEARCH="$(verdict BANNED_SHELL_SEARCH "$VERDICT_FIND")"
 AGENTGREP_INPUT="$(verdict AGENTGREP_INPUT "$VERDICT_FIND")"
+AGENTGREP_CALLS="$(verdict AGENTGREP_CALLS "$VERDICT_FIND")"
 FINAL_TEXT="$(verdict FINAL_TEXT "$VERDICT_FIND")"
 
-# 1b. Exactly one code-search tool_use and it is canonical agentgrep.
-[[ "$CODESEARCH_USED" == "agentgrep" ]] || fail "[find] expected ONLY agentgrep as code-search tool use, got: $CODESEARCH_USED (all tools: $TOOLS_USED)"
+# 1b. At least one local code-search call in this phase, and EVERY code-search
+# call must be canonical `agentgrep` (multi-call runs pass as long as every call
+# is canonical agentgrep).
+code_search_count=0
+non_canonical_cs=""
+IFS=',' read -ra cs_tools <<< "$CODESEARCH_USED"
+for cs_tool in "${cs_tools[@]}"; do
+  if [[ -n "$cs_tool" ]]; then
+    code_search_count=$((code_search_count + 1))
+    if [[ "$cs_tool" != "agentgrep" ]]; then
+      non_canonical_cs="$non_canonical_cs,$cs_tool"
+    fi
+  fi
+done
+[[ "$code_search_count" -ge 1 ]] || fail "[find] no local code-search call detected (expected >=1 canonical agentgrep call)"
+[[ "$code_search_count" -le "$MAX_CALLS" ]] || fail "[find] local code-search calls $code_search_count exceed MAX_CALLS=$MAX_CALLS (run looks unbounded)"
+[[ -z "$non_canonical_cs" ]] || fail "[find] every code-search call must be canonical agentgrep; found non-canonical: ${non_canonical_cs#,} (all: $CODESEARCH_USED)"
 
-# 3. No callmux tool/result retrieval.
+# 2b. Explicit fail on bare find/grep/glob/Grep/file_grep or any callmux usage.
+[[ -z "$BANNED_CODE_SEARCH" ]] || fail "[find] banned code-search tool(s) used: $BANNED_CODE_SEARCH (all tools: $TOOLS_USED)"
+[[ -z "$BANNED_SHELL_SEARCH" ]] || fail "[find] shell-based local search bypassed canonical agentgrep: $BANNED_SHELL_SEARCH"
 [[ -z "$CALLMUX_USED" ]] || fail "[find] callmux tool/result retrieval occurred: $CALLMUX_USED"
 
-# 2b. Input MUST have BOTH explicit mode=find AND at least one useful
-# discovery term (the prompt asks for session-storage files, so the model must
-# pass a real discovery query — not just mode=find with an empty search).
-MODE_FIND=0
-TERMS_FIND=0
-case "$AGENTGREP_INPUT" in
-  *'"mode": "find"'*|*'"mode":"find"'*|*"mode: find"*) MODE_FIND=1 ;;
-esac
-# NOTE: do NOT treat the mode value itself as a term — the mode match above is
-# the ONLY place "find" is allowed; here only real discovery terms count.
-case "$AGENTGREP_INPUT" in
-  *session*|*store*|*storage*) TERMS_FIND=1 ;;
-esac
-[[ "$MODE_FIND" -eq 1 && "$TERMS_FIND" -eq 1 ]] || fail "[find] agentgrep input must have BOTH explicit mode=find AND a useful discovery term: $AGENTGREP_INPUT"
+# 3b. EVERY canonical call must use the phase's required mode (explicit
+# mode=find — find is NOT the default); AT LEAST ONE call must carry the
+# phase's expected discovery terms.
+ag_call_count=0
+ag_mode_bad=0
+ag_terms_ok=0
+IFS='|||' read -ra ag_calls <<< "$AGENTGREP_CALLS"
+for ac in "${ag_calls[@]}"; do
+  [[ -z "$ac" ]] && continue
+  ag_call_count=$((ag_call_count + 1))
+  if [[ "$ac" != *'"mode": "find"'* && "$ac" != *'"mode":"find"'* && "$ac" != *'mode: find'* ]]; then
+    ag_mode_bad=1
+  fi
+  # NOTE: only real discovery terms count — the mode value "find" is NOT a term.
+  if [[ "$ac" == *"session"* || "$ac" == *"store"* || "$ac" == *"storage"* ]]; then
+    ag_terms_ok=$((ag_terms_ok + 1))
+  fi
+done
+[[ "$ag_call_count" -ge 1 ]] || fail "[find] no agentgrep call input captured for mode/terms validation"
+[[ "$ag_mode_bad" -eq 0 ]] || fail "[find] at least one agentgrep call does not use the phase's required mode=find: $AGENTGREP_CALLS"
+[[ "$ag_terms_ok" -ge 1 ]] || fail "[find] no agentgrep call carries the phase's expected discovery terms (session/store/storage): $AGENTGREP_CALLS"
 
-# 4b. Fake binary invoked EXACTLY once, in find subcommand.
-INVOCATIONS="$(grep -c '^\[ARGV\]' "$RECORD" 2>/dev/null || true)"
-[[ "$INVOCATIONS" -eq 1 ]] || fail "[find] fake agentgrep binary invoked $INVOCATIONS times (expected exactly 1)"
-grep -q '^\[ARGV\]	find	' "$RECORD" || fail "[find] fake invocation was not find subcommand: $(grep '^\[ARGV\]' "$RECORD" | redact | head -n1)"
+# 4b. Fake CLI: recorded invocations >=1 and <= MAX_CALLS; EVERY invocation
+# subcommand must match the phase (find).
+INVOCATIONS=0
+find_sub=0
+while IFS= read -r invline; do
+  [[ -z "$invline" ]] && continue
+  INVOCATIONS=$((INVOCATIONS + 1))
+  case "$invline" in
+    $'[ARGV]\tfind\t'*) find_sub=$((find_sub + 1)) ;;
+  esac
+done < <(grep '^\[ARGV\]' "$RECORD" 2>/dev/null || true)
+[[ "$INVOCATIONS" -ge 1 && "$INVOCATIONS" -le "$MAX_CALLS" ]] || fail "[find] fake agentgrep binary invoked $INVOCATIONS times (expected >=1, <=$MAX_CALLS)"
+[[ "$find_sub" -eq "$INVOCATIONS" ]] || fail "[find] only $find_sub of $INVOCATIONS fake invocations used 'find' subcommand (every invocation must match phase): $(grep '^\[ARGV\]' "$RECORD" | redact | paste -sd';' -)"
 
 # 5b. Expected result reached the model.
 case "$FINAL_TEXT" in
@@ -434,9 +530,9 @@ case "$FINAL_TEXT" in
   *) fail "[find] expected result did not reach the model final text: $FINAL_TEXT" ;;
 esac
 
-echo "  [find] PASS: ranked file discovery selected canonical agentgrep (mode=find), no bare find/grep/glob/Grep/file_grep/callmux, fake invoked once, discovery result reached the model." >&2
+echo "  [find] PASS: $code_search_count agentgrep call(s) (all canonical, mode=find, <=$MAX_CALLS), $INVOCATIONS phase-matching fake invocation(s), discovery result reached the model." >&2
 echo "  [find] tool uses: $TOOLS_USED" >&2
 
 # ═══════════════════════════════════════════════════════════════════════════════
-echo "SMOKE-PASS: both runs passed — exact grep search and ranked find discovery both selected canonical agentgrep; no config-level tools.grep/tools.glob needed (plugin config hook did it)."
+echo "SMOKE-PASS: both runs passed — exact grep search and ranked find discovery each made 1..$MAX_CALLS local-search calls, all canonical agentgrep with the correct phase mode and phase-matching fake invocations; forbidden bare search/callmux tools were absent; no config-level tools.grep/tools.glob needed (plugin config hook did it)."
 exit 0
