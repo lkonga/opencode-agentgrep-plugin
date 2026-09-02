@@ -3,9 +3,8 @@
 // hook from index.ts (the typed single default export).
 //
 // Scope is deliberately narrow: it only tells the model which tool to use for
-// LOCAL repository code search. It never mentions grep/glob (unavailable), only
-// recommends canonical `agentgrep` (+ `find` for ranked discovery), forbids the
-// compatibility `Grep`/`file_grep` ids, and explicitly carves out external MCP/
+// LOCAL repository code search. It recommends only canonical `agentgrep`,
+// forbids native and compatibility ids, and explicitly carves out external MCP/
 // web tasks so callmux behavior is untouched for those.
 //
 // Idempotent: `applyAgentGrepSystemGuidance` appends the guidance only once,
@@ -26,8 +25,8 @@ export function agentgrepSystemGuidance(): string {
     AGENTGREP_GUIDANCE_MARKER,
     "For LOCAL repository code search, use the `agentgrep` tool for exact lexical search",
     "(mode=grep), file outlines (mode=outline), and relationship traces (mode=trace); it can",
-    "also do ranked file discovery with mode=find. Use the `find` tool only for ranked file",
-    "discovery. Never call tools named `grep`, `glob`, `Grep`, or `file_grep` for local",
+    "also do ranked file discovery with mode=find. `agentgrep` is the canonical local search",
+    "tool. Never call tools named `find`, `grep`, `glob`, `Grep`, or `file_grep` for local",
     "repository search, and never use callmux or result retrieval for LOCAL repository search.",
     "This guidance does not apply to external MCP or web tasks, where callmux remains available.",
   ].join("\n")

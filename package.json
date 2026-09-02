@@ -1,7 +1,7 @@
 {
   "name": "@lkonga/opencode-agentgrep",
   "version": "0.3.0",
-  "description": "OpenCode plugin: code search and retrieval via the agentgrep CLI (pinned v0.1.6) — canonical agentgrep (grep/outline/trace + mode=find) and find (ranked discovery), with native path permissions, bounded execution, and best-effort session harness context (--context-json). Legacy aliases Grep/file_grep opt-in via AGENTGREP_LEGACY_ALIASES=1.",
+  "description": "OpenCode plugin: canonical agentgrep search (grep/find/outline/trace) with automatic native grep/glob replacement, explicit compatibility aliases, native path permissions, bounded execution, and best-effort session harness context (--context-json).",
   "type": "module",
   "main": "./index.ts",
   "exports": {

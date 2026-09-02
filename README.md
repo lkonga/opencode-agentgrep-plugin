@@ -2,19 +2,20 @@
 
 **v0.3.0** — Standalone OpenCode backend plugin exposing the
 [`agentgrep`](https://github.com/1jehuang/agentgrep) CLI (pinned **v0.1.6**) as
-native `Hooks.tool` `ToolDefinition`s: the canonical **`agentgrep`** (exact
-grep, file outlines, relationship traces, plus mode=find for ranked file
-discovery) and the first-class **`find`** shortcut (ranked file discovery
-only). **No `grep`/`glob` ids** (the native tools are disabled by user
-config). The legacy compatibility aliases `file_grep`/`Grep` are registered
-only when `AGENTGREP_LEGACY_ALIASES=1` is set. A **system guidance hook**
-(attached to `experimental.chat.system.transform`) idempotently tells the model
-to use `agentgrep` for local repo code search and never call the unavailable
-native grep/glob or the compatibility aliases; external MCP/web tasks calling
-callmux are untouched. A separate **TUI facade** (`tui.ts`) makes the plugin
-visible in the TUI Plugins screen. The harness context adapter seeds
-trace/smart/outline with a **best-effort current-session harness context**
-(`--context-json`).
+native `Hooks.tool` `ToolDefinition`s. The default model-facing registry
+exposes exactly **one** tool: the canonical **`agentgrep`** (exact grep, file
+outlines, relationship traces, plus mode=find for ranked file discovery —
+**no separate `find` id**). The config hook automatically disables the native
+`grep`/`glob` tools (`tools.grep=false`, `tools.glob=false`) while preserving
+unrelated merged config. Explicit compatibility aliases (`find`, `file_grep`,
+`Grep`) are registered only through the portable `compatibilityAliases` tuple
+option. A **system guidance hook** (attached to
+`experimental.chat.system.transform`) idempotently tells the model to use
+`agentgrep` for local repo code search and never call the unavailable native
+grep/glob or the compatibility aliases; external MCP/web tasks calling callmux
+are untouched. A separate **TUI facade** (`tui.ts`) makes the plugin visible in
+the TUI Plugins screen. The harness context adapter seeds trace/smart/outline
+with a **best-effort current-session harness context** (`--context-json`).
 
 No fork patches, no opencode-patches dependency. The plugin is a plain package
 that can be installed from npm or loaded from a local directory via `file://`.
@@ -38,11 +39,25 @@ that can be installed from npm or loaded from a local directory via `file://`.
 
    ```jsonc
    {
-     "plugin": ["@lkonga/opencode-agentgrep"],
-     "tools": {
-       "grep": false,
-       "glob": false
-     }
+     "plugin": ["@lkonga/opencode-agentgrep"]
+   }
+   ```
+
+   The plugin's config hook automatically disables `tools.grep=false` and
+   `tools.glob=false` (deep-merged with your existing config). If you need
+   to keep the native tools, use the portable tuple opt-out:
+
+   ```jsonc
+   {
+     "plugin": [["@lkonga/opencode-agentgrep", { "replaceNativeSearch": false }]]
+   }
+   ```
+
+   To register explicit compatibility aliases without enabling native tools:
+
+   ```jsonc
+   {
+     "plugin": [["@lkonga/opencode-agentgrep", { "compatibilityAliases": ["find", "file_grep", "Grep"] }]]
    }
    ```
 
@@ -50,20 +65,27 @@ that can be installed from npm or loaded from a local directory via `file://`.
 
    ```jsonc
    {
-     "plugin": ["file:///home/lkonga/codes/opencode-plugins/opencode-agentgrep"],
-     "tools": {
-       "grep": false,
-       "glob": false
-     }
+     "plugin": ["file:///home/lkonga/codes/opencode-plugins/opencode-agentgrep"]
    }
    ```
 
    A directory `file://` plugin resolves through `package.json` `"main"` →
    `./index.ts`. Restart OpenCode after installing or changing the plugin.
 
-3. **Disable the native search tools** so the replacement is total (leaving
-   either enabled makes it partial). With swap: `swap tool disable grep` /
-   `swap tool disable glob`.
+   **Portable tuple options** (second element of the plugin tuple):
+
+   | Option | Type | Default | Description |
+   |---|---|---|---|
+   | `replaceNativeSearch` | `boolean` | `true` | Disable the native `grep`/`glob` tools in the merged config. Set exactly `false` to keep them. |
+   | `compatibilityAliases` | `string[]` | `[]` | Exact tool ids to register in addition to canonical `agentgrep`. Accepted values: `"find"`, `"file_grep"`, `"Grep"`. |
+
+3. **Native-tool replacement is automatic.** The plugin's `config` hook sets
+   `tools.grep=false` / `tools.glob=false` in the merged config (preserving
+   unrelated tool settings), so the replacement is total by default. Opt out
+   with the exact portable tuple `["...", {"replaceNativeSearch": false}]`.
+   Note that opting out of the native replacement does **not** enable
+   compatibility aliases — those are controlled independently by
+   `compatibilityAliases`.
 
 ## Requirements
 
@@ -88,7 +110,7 @@ plugin function (or a `{ server }` record). A `.ts` plugin whose entrypoint
 also exports constants/helpers therefore fails to load at startup.
 
 - **`index.ts`** — the loader entrypoint. Its **only** export is the default
-  plugin function (`async () => ({ tool, "experimental.chat.system.transform" })`).
+  plugin function (`async () => ({ tool, config, "experimental.chat.system.transform" })`).
   Nothing else may be exported from this file.
 - **`tui.ts`** — separate **TUI facade** (loaded only from `tui.json`): unique
   id + `tui()` function, no `server` export; provides a harmless `/agentgrep`
@@ -97,8 +119,8 @@ also exports constants/helpers therefore fails to load at startup.
   re-exports every public helper from the focused modules, so tests and
   adapters keep a single import surface. (Not a plugin entrypoint.)
 - **`agentgrep-types.ts`** — contract: tool-id constants, `AgentGrepInput` /
-  `AgentGrepMode`, registry options (`legacyAliases`), mode normalization, and
-  match-all glob normalization. Pure.
+  `AgentGrepMode`, plugin options (`replaceNativeSearch`, `compatibilityAliases`),
+  sanitization, mode normalization, and match-all glob normalization. Pure.
 - **`agentgrep-guidance.ts`** — idempotent LOCAL-only code-search system
   guidance (marker + text + `applyAgentGrepSystemGuidance`). Pure.
 - **`agentgrep-args.ts`** — exact-file scope translation, find term splitting,
@@ -107,7 +129,7 @@ also exports constants/helpers therefore fails to load at startup.
 - **`agentgrep-tools.ts`** — OpenCode schemas (`tool.schema` zod v4),
   descriptions, the shared execute orchestration (permission asks → canonical
   roots → argv → bounded spawn), and the registry builder (default
-  `agentgrep`+`find`; legacy aliases opt-in).
+  `agentgrep` only; explicit compatibility aliases opt-in).
 - **`agentgrep-paths.ts`** — canonical root resolution, project containment,
   and native-shaped `external_directory` requests.
 - **`agentgrep-exec.ts`** — executable resolution and bounded process
@@ -141,29 +163,46 @@ also exports constants/helpers therefore fails to load at startup.
   `--context-json` is passed, the context file is valid/0600, it is copied
   before cleanup, the tempdir is removed, and exact-file containment holds.
 - **`scripts/smoke-oc-selection.sh`** — end-to-end real-`oc` smoke proving the
-  model selects canonical `agentgrep` (never grep/Grep/file_grep/callmux) for
-  local repo search of the regression input `passthroughStream`.
+  model selects canonical `agentgrep` (never find/grep/Grep/file_grep/callmux)
+  for BOTH exact lexical search (mode=grep) and ranked file discovery (mode=find),
+  using the regression input `passthroughStream`.
 
 ## Schema & parity (jcode v0.1.6)
 
 ### Default model-facing registry
 
-The default registry exposes exactly **two** tool ids:
+The default registry exposes exactly **one** tool id:
 
 | Id | Purpose |
 |----|---------|
 | `agentgrep` | Canonical local code-search tool. Accepts all modes: `grep` (exact), `outline` (file structure), `trace` (relationship DSL), and `find` (ranked file discovery). |
-| `find` | Ranked file-discovery shortcut (forces `find` mode; no `mode` arg). |
 
-**Legacy aliases** (`file_grep`, `Grep` — exact case) are registered only when
-`AGENTGREP_LEGACY_ALIASES=1` is set (at startup; the plugin reads the env var).
-They are compatibility-only and should be avoided in new callers.
+**Explicit compatibility aliases** (`find`, `file_grep`, `Grep` — exact case)
+are registered only when requested through the portable tuple option
+`compatibilityAliases`, e.g. `["...", {"compatibilityAliases":["find","file_grep","Grep"]}]`
+or find-only `["...", {"compatibilityAliases":["find"]}]`. `find` is **never**
+registered implicitly — there is no first-class `find` id. The `find` alias is
+a **purpose-built, forced-find ToolDefinition**: its schema has no `mode` arg
+and any `mode` passed by the model is ignored (the id always executes agentgrep
+`find`). `file_grep`/`Grep` reuse the mode-flexible canonical schema. All alias
+descriptions explicitly label themselves compatibility-only and point at the
+canonical `agentgrep` mode that matches their role.
 
-**`grep` id and `glob` id are deliberately absent** — OpenCode's permission
-gate `tools.grep=false` / `tools.glob=false` filters any tool with those exact
-ids, so a grep/glob-id plugin alias would be unreachable and would silently
-never fire. The native `grep` and `glob` tools are disabled by user config
-(`tools.grep=false`, `tools.glob=false`), not by this plugin.
+**`grep` id and `glob` id are deliberately absent** — the plugin's config hook
+sets `tools.grep=false` / `tools.glob=false` (unless `replaceNativeSearch:false`),
+and OpenCode's `tools` config filter removes any tool with those exact ids from
+the model-facing registry, so a grep/glob-id plugin alias would be unreachable
+and would silently never fire.
+The native `grep` and `glob` tools are disabled through `tools=false` config
+semantics (the plugin's config hook writes `tools.grep=false` /
+`tools.glob=false` into the merged config), NOT via permission deny rules —
+the `permission.agentgrep` setting remains an execution authorization and is
+separate from tool visibility.
+
+**Native opt-out vs aliases are independent**: `replaceNativeSearch:false`
+keeps the native `grep`/`glob` tools enabled but does **not** register any
+compatibility aliases; `compatibilityAliases` registers aliases without
+changing native-tool behavior.
 
 ### Tool schema
 
@@ -184,8 +223,10 @@ args on `agentgrep` (key order fixed):
 | `max_regions` | int? | trace region bound; CLI-side default 6. |
 | `paths_only` | boolean? | Return only matching paths where supported. |
 
-The `find` id exposes the find-relevant subset: `query, terms, path, glob,
-type, max_files, paths_only` (no `mode` — the id itself forces find mode).
+The `find` mode is a mode of the canonical `agentgrep` tool (no separate `find`
+id by default) and uses the same schema surface above. An explicitly requested
+`find` compatibility alias is a **purpose-built, forced-find ToolDefinition**
+with a separate schema (no `mode` arg — the id always pins `find` mode).
 
 **Deliberately internal (accepted at runtime, never advertised in the schema):**
 `pattern`, `file_path`, `include`, `hidden`, `no_ignore`, `full_region`,
@@ -272,10 +313,12 @@ triggers an unknown-flag clap error (e.g. `outline` + `--type` → clap exit 2).
 - Denials **reject** execute (they are not converted to tool results), so a
   denied call never spawns the agentgrep process.
 - The registry intentionally has **no `grep` id and no `glob` id**:
-  `tools.grep=false` / `tools.glob=false` filter every tool with those exact
-  ids, so grep/glob-id plugin aliases would be unreachable. The default registry
-  exposes **`agentgrep` + `find`** only; the legacy compatibility aliases
-  `file_grep`/`Grep` are opt-in via `AGENTGREP_LEGACY_ALIASES=1`.
+  the config hook disables the native `grep`/`glob` tools through `tools=false`
+  semantics; `replaceNativeSearch:false` is the explicit portable opt-out. The
+  default registry exposes **only `agentgrep`**; the explicit compatibility
+  aliases (`find`, `file_grep`, `Grep`) are registered only through
+  `compatibilityAliases`. The `find` alias is a purpose-built forced-find
+  ToolDefinition; `file_grep`/`Grep` reuse the mode-flexible schema.
 
 ## Executable resolution
 
@@ -294,7 +337,6 @@ installer command and the `AGENTGREP_BIN` escape hatch.
 | `AGENTGREP_TIMEOUT_MS` | `30000` | Run timeout; the child tree is killed on expiry. |
 | `AGENTGREP_MAX_OUTPUT_CHARS` | `200000` | Per-stream output cap; the child tree is killed on exceed. |
 | `AGENTGREP_CONTEXT_DEBUG` | unset | `1` → harness-context diagnostics on stderr (counts/sources only — never paths, JSON content, or temp paths). |
-| `AGENTGREP_LEGACY_ALIASES` | unset | `1` → also register the legacy compatibility aliases `file_grep` and `Grep` (exact case) on the model-facing registry. |
 | `AGENTGREP_INSTALL_DIR` | `~/.local/bin` | Installer prefix. |
 | `AGENTGREP_BUILD_DIR` / `AGENTGREP_SKIP_BUILD` | — | Installer reuse/idempotence knobs. |
 
@@ -312,9 +354,8 @@ hook that appends a concise, LOCAL-only code-search hint to the system prompt:
 - use `agentgrep` for exact search (mode=grep), file outlines (mode=outline),
   and relationship traces (mode=trace); it can also do ranked discovery with
   mode=find;
-- use `find` **only** for ranked file discovery;
-- never call tools named `grep`, `glob`, `Grep`, or `file_grep` for local
-  repository search;
+- never call tools named `find`, `grep`, `glob`, `Grep`, or `file_grep` for
+  local repository search;
 - never use callmux or result retrieval for **local repository** search — the
   guidance explicitly carves out external MCP/web tasks, where callmux remains
   available.
@@ -472,11 +513,12 @@ OC_SMOKE_MODEL=provider/model bash scripts/smoke-oc-selection.sh
 ```
 
 The selection smoke proves the model selects the canonical `agentgrep` tool
-(never bare `grep`/`glob`/`Grep`/`file_grep`/`callmux`) for local repository
-code search, using the regression input `passthroughStream`. It uses a
-controlled fake agentgrep binary and captures `--format json` events to assert
-tool selection. Exits 2 (SKIP) when `OC_SMOKE_MODEL` is unset, 0 on pass, 1 on
-failure. No secrets are printed and no temp files are left behind.
+(never bare `find`/`grep`/`glob`/`Grep`/`file_grep`/`callmux`) for local
+repository code search, using BOTH exact lexical search and ranked file
+discovery. It uses a controlled fake agentgrep binary and captures `--format
+json` events to assert tool selection. Exits 2 (SKIP) when `OC_SMOKE_MODEL` is
+unset, 0 on pass, 1 on failure. No secrets are printed and no temp files are
+left behind.
 
 **The context smoke is NOT hermetic by design.** It runs a real `oc run` against the
 ACTIVE OpenCode config and reads the existing provider/credential

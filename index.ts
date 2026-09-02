@@ -10,23 +10,22 @@
 // focused `agentgrep-*.ts` modules (see README.md for the module layout), and
 // the TUI facade lives in a separate `tui.ts` (loaded only from tui.json).
 //
-// Default model-facing registry: canonical `agentgrep` (exact grep/outline/
-// trace, and mode=find) + the first-class `find` shortcut (ranked file
-// discovery). Legacy compatibility aliases `file_grep`/`Grep` are opt-in via
-// `$AGENTGREP_LEGACY_ALIASES=1`. `PluginInput` is threaded into
+// Default model-facing registry: exactly one canonical `agentgrep` tool (modes
+// grep/find/outline/trace). Compatibility ids are available only through the
+// explicit `compatibilityAliases` plugin tuple option. `PluginInput` is threaded into
 // `buildAgentGrepTools` so the harness context adapter can feature-detect the
 // injected SDK client and, when needed, lazily build a v2 client from
 // `input.serverUrl`.
 //
 // Architecture constraint (see agentgrep-core.ts for the full rationale): the
-// model-facing registry intentionally has NO `grep` id — OpenCode's
-// `tools.grep=false` permission gate filters every tool whose id is exactly
-// `grep`, so a bare `grep` id could never fire. Native grep/glob are disabled
-// by user config (`tools.grep=false` / `tools.glob=false`), not by this plugin.
+// model-facing registry intentionally has NO bare `grep` or `glob` id. The
+// config hook disables OpenCode's native grep/glob tools by default while
+// preserving unrelated tool settings. `replaceNativeSearch:false` is the
+// explicit portable opt-out.
 //
 // System guidance: the `experimental.chat.system.transform` hook appends an
-// idempotent, LOCAL-only code-search hint (use `agentgrep` for exact/outline/
-// trace, `find` only for ranked discovery; never grep/glob/Grep/file_grep;
+// idempotent, LOCAL-only code-search hint (use `agentgrep` for exact/find/
+// outline/trace; never find/grep/glob/Grep/file_grep;
 // never callmux for local repo search — external MCP/web tasks are untouched).
 //
 // Everything shells out WITHOUT shell interpolation: argv is assembled by the
@@ -34,11 +33,25 @@
 // command strings are ever built by string concatenation.
 
 import type { Plugin, PluginInput } from "@opencode-ai/plugin"
-import { applyAgentGrepSystemGuidance, buildAgentGrepTools } from "./agentgrep-core"
+import {
+  applyAgentGrepSystemGuidance,
+  buildAgentGrepTools,
+  sanitizeAgentGrepPluginOptions,
+} from "./agentgrep-core"
 
-export default (async (input: PluginInput) => ({
-  tool: buildAgentGrepTools(input),
-  "experimental.chat.system.transform": async (_input, output) => {
-    output.system = applyAgentGrepSystemGuidance(output.system)
-  },
-})) satisfies Plugin
+export default (async (input: PluginInput, options?: unknown) => {
+  const resolvedOptions = sanitizeAgentGrepPluginOptions(options)
+
+  return {
+    config: async (config) => {
+      if (!resolvedOptions.replaceNativeSearch) return
+      config.tools ??= {}
+      config.tools.grep = false
+      config.tools.glob = false
+    },
+    tool: buildAgentGrepTools(input, resolvedOptions),
+    "experimental.chat.system.transform": async (_input, output) => {
+      output.system = applyAgentGrepSystemGuidance(output.system)
+    },
+  }
+}) satisfies Plugin

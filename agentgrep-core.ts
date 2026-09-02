@@ -24,8 +24,8 @@
 //   - Everything shells out WITHOUT shell interpolation: argv is assembled by
 //     the pure `buildAgentGrepArgs` and passed to Bun.spawn as an array.
 //   - The model-facing registry intentionally has NO `grep` id and NO `glob`
-//     id — tools.grep=false / tools.glob=false filter every tool with those
-//     exact ids, so a bare grep/glob id could never fire.
+//     id. The server plugin's config hook disables OpenCode's native tools by
+//     default; explicit compatibility aliases never include those bare ids.
 //   - Permission asks use the canonical `agentgrep` permission with the split
 //     operation patterns and the native `external_directory` asks; denials
 //     propagate before any spawn.
@@ -37,9 +37,15 @@ export {
   resolveAgentGrepToolID,
   normalizeAgentGrepMode,
   normalizeMatchAllGlob,
-  legacyAliasesEnabled,
+  sanitizeAgentGrepPluginOptions,
 } from "./agentgrep-types"
-export type { AgentGrepInput, AgentGrepMode, AgentGrepRegistryOptions } from "./agentgrep-types"
+export type {
+  AgentGrepCompatibilityAlias,
+  AgentGrepInput,
+  AgentGrepMode,
+  AgentGrepPluginOptions,
+  ResolvedAgentGrepPluginOptions,
+} from "./agentgrep-types"
 
 export {
   AGENTGREP_GUIDANCE_MARKER,

@@ -21,7 +21,7 @@ export default {
         title: "agentgrep: canonical server tool status",
         value: "agentgrep.status",
         description:
-          "agentgrep server plugin status: canonical `agentgrep` (grep/outline/trace + mode=find) and `find` (ranked discovery) are registered; legacy `Grep`/`file_grep` only with AGENTGREP_LEGACY_ALIASES=1.",
+          "agentgrep server plugin status: the default registry exposes only canonical `agentgrep` with mode=grep|find|outline|trace and replaces native grep/glob.",
         category: "agentgrep",
         slash: { name: "agentgrep", aliases: [] },
         onSelect: () => {
@@ -29,7 +29,7 @@ export default {
             variant: "info",
             title: "agentgrep",
             message:
-              "Canonical server tool: agentgrep (mode grep|outline|trace, also mode=find). `find` is the ranked file-discovery shortcut. Legacy Grep/file_grep only with AGENTGREP_LEGACY_ALIASES=1. Check the server tool registry for live availability.",
+              "Canonical server tool: agentgrep (mode grep|find|outline|trace). Native grep/glob are replaced by default; compatibility aliases require explicit plugin tuple options. Check the server tool registry for live availability.",
           })
         },
       },

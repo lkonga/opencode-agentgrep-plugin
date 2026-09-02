@@ -110,16 +110,21 @@ printf 'export function alpha() { return "x" }\n// auth marker here\n' >"$WORKDI
 
 # ── Inject only the plugin + permissions; read the active config read-only ───
 #   plugin:        same directory file:// URL the stable config uses -> deduped
-#   tools:         ensure native grep/glob stay disabled (deep-merged)
+#   tools:         NOT injected — the plugin config hook sets grep=false and
+#                  glob=false automatically; this proves the hook runs.
 #   permission:    auto-approve agentgrep + external_directory for a
 #                  non-interactive `oc run`
 export OPENCODE_CONFIG_CONTENT="$(
-  printf '{"plugin":["file://%s"],"tools":{"grep":false,"glob":false}}' "$PLUGIN_DIR"
+  printf '{"plugin":["file://%s"]}' "$PLUGIN_DIR"
 )"
 export OPENCODE_PERMISSION='{"agentgrep":"allow","external_directory":"allow"}'
 # Fresh in-process server so the plugin loads with the env above (NOT an
 # attachment to an already-running shared server holding the real binary).
 export OPENCODE_SHARED_SERVER=0
+# Ignore any project-scoped config (.opencode/) so the pass is host-config
+# independent. This only disables PROJECT config — user/global config (where
+# model auth lives) is still read, so OC_SMOKE_MODEL keeps working.
+export OPENCODE_DISABLE_PROJECT_CONFIG=1
 
 # ── Isolate only the plugin's context tempdir + fake CLI wiring ──────────────
 export TMPDIR="$TMPSTATE"

@@ -1540,7 +1540,7 @@ esac
       expect(rec).not.toContain("--context-json")
 
       fs.writeFileSync(harness.record, "")
-      await tools.find.execute({ query: "x" }, ctx)
+      await tools.agentgrep.execute({ mode: "find", query: "x" }, ctx)
       rec = readRecord().find((l) => l.startsWith("find\t"))
       expect(rec).not.toContain("--context-json")
     } finally {
@@ -1711,19 +1711,19 @@ esac
     const ctx = ctxFor(dir)
     try {
       fs.writeFileSync(harness.record, "")
-      await tools.find.execute({ glob: "*.ts" }, ctx)
+      await tools.agentgrep.execute({ mode: "find", glob: "*.ts" }, ctx)
       const globOnly = readRecord().find((l) => l.startsWith("find\t"))
       expect(globOnly).toContain("--glob")
       expect(globOnly).not.toContain("--context-json")
 
       fs.writeFileSync(harness.record, "")
-      await tools.find.execute({ file_type: "ts" }, ctx)
+      await tools.agentgrep.execute({ mode: "find", file_type: "ts" }, ctx)
       const typeOnly = readRecord().find((l) => l.startsWith("find\t"))
       expect(typeOnly).toContain("--type")
       expect(typeOnly).not.toContain("--context-json")
 
       fs.writeFileSync(harness.record, "")
-      await tools.find.execute({ path: "a.ts" }, ctx)
+      await tools.agentgrep.execute({ mode: "find", path: "a.ts" }, ctx)
       const fileOnly = readRecord().find((l) => l.startsWith("find\t"))
       expect(fileOnly).toContain("--glob")
       expect(fileOnly).toContain("--path")

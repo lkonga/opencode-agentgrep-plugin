@@ -1,29 +1,34 @@
 #!/usr/bin/env bash
 #
 # smoke-oc-selection — reproducible end-to-end proof that a REAL `oc run`
-# selects the CANONICAL `agentgrep` tool (never bare grep / Grep / file_grep /
-# callmux) for LOCAL repository code search, using the exact regression input
-# `passthroughStream`.
+# selects the CANONICAL `agentgrep` tool (never bare find / grep / Grep /
+# file_grep / callmux) for BOTH (a) exact lexical search (mode=grep) and
+# (b) ranked file discovery (mode=find).
 #
 # To run it deterministically you must force a real model:
 #     OC_SMOKE_MODEL=provider/model bash scripts/smoke-oc-selection.sh
 # (e.g. OC_SMOKE_MODEL=codex-omniroute/om-cx-gpt-5.6-sol-fast). If OC_SMOKE_MODEL
 # is unset the script SKIPS (exit 2) with a clear message.
 #
-# What it proves:
-#   1. The ONLY local code-search tool_use in the run is canonical `agentgrep`.
-#   2. Its input is grep mode with query/pattern `passthroughStream`.
-#   3. No bare `grep`, `glob`, `Grep`, `file_grep`, or `callmux*` tool use.
-#   4. The controlled fake agentgrep binary is invoked EXACTLY ONCE.
-#   5. The expected result (19 matches across 6 files) reaches the model.
+# What it proves (TWO sequential oc runs):
+#   1. Run 1 (exact grep): the ONLY code-search tool_use is canonical `agentgrep`
+#      with mode=grep (or omitted default) and query/pattern `passthroughStream`.
+#   2. Run 2 (ranked find): the ONLY code-search tool_use is canonical `agentgrep`
+#      with mode=find and relevant discovery terms (e.g. "session store").
+#   3. No bare `find`, `grep`, `glob`, `Grep`, `file_grep`, or `callmux*` tool use
+#      in either run.
+#   4. The controlled fake agentgrep binary is invoked EXACTLY ONCE per run with
+#      the correct subcommand (grep / find).
+#   5. The expected result reaches the model in each run.
+#   6. Pass does NOT rely on injecting tools.grep/tools.glob in OPENCODE_CONFIG_CONTENT
+#      — the plugin's config hook performs the replacement automatically.
 #
-# Host-environment notes (mirrors smoke-oc-context.sh):
+# Host-environment notes:
 #   - Uses a CONTROLLED FAKE agentgrep binary via AGENTGREP_BIN.
 #   - Uses a FRESH in-process server (OPENCODE_SHARED_SERVER=0).
 #   - READS the ACTIVE OPENCODE_CONFIG_DIR / provider config / credentials
-#     read-only and injects ONLY this plugin + permissions
-#     (OPENCODE_CONFIG_CONTENT / OPENCODE_PERMISSION). Does NOT touch
-#     XDG_DATA_HOME / OPENCODE_DATA_HOME / OPENCODE_CONFIG_DIR.
+#     read-only and injects ONLY this plugin (OPENCODE_CONFIG_CONTENT).
+#     Does NOT touch XDG_DATA_HOME / OPENCODE_DATA_HOME / OPENCODE_CONFIG_DIR.
 #   - Capture is `oc run --format json`; diagnostics are redacted.
 #   - Portable poll-loop watchdog (no blocked external `timeout` wrapper).
 #
@@ -51,8 +56,10 @@ SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/oc-smoke-selection.XXXXXX")"
 WORKDIR="$SANDBOX/workspace"
 TMPSTATE="$SANDBOX/tmp"
 RECORD="$SANDBOX/record.txt"
-EVENTS="$SANDBOX/events.jsonl"
-VERDICT="$SANDBOX/verdict.txt"
+EVENTS_GREP="$SANDBOX/events-grep.jsonl"
+EVENTS_FIND="$SANDBOX/events-find.jsonl"
+VERDICT_GREP="$SANDBOX/verdict-grep.txt"
+VERDICT_FIND="$SANDBOX/verdict-find.txt"
 OC_LOG="$SANDBOX/oc.log"
 
 cleanup() {
@@ -66,10 +73,12 @@ trap cleanup EXIT
 
 mkdir -p "$WORKDIR" "$WORKDIR/src" "$TMPSTATE"
 
-# Workspace with files that (in the real world) contain the regression term.
+# Workspace with files for BOTH grep and find scenarios.
 printf 'export const passthroughStream = 1\n' >"$WORKDIR/passthroughStream.ts"
 printf '// passthroughStream used here\n' >"$WORKDIR/src/a.ts"
 printf '// and here too\n' >"$WORKDIR/src/b.ts"
+printf '// session persistence\n' >"$WORKDIR/src/session-store.ts"
+printf 'export const store = "session"\n' >"$WORKDIR/src/store.ts"
 
 # ── Controlled fake agentgrep binary ─────────────────────────────────────────
 FAKE_BIN="$SANDBOX/agentgrep-fake"
@@ -82,113 +91,72 @@ case "${1:-}" in
 passthroughStream (19 matches across 6 files)
 passthroughStream.ts:1: export const passthroughStream = 1
 src/a.ts:2: // passthroughStream used here
-src/a.ts:5: passthroughStream
-src/a.ts:8: passthroughStream
-src/a.ts:11: passthroughStream
-src/b.ts:3: passthroughStream
-src/b.ts:6: passthroughStream
-src/c.ts:4: passthroughStream
-src/c.ts:7: passthroughStream
-src/d.ts:9: passthroughStream
-src/d.ts:12: passthroughStream
-src/e.ts:10: passthroughStream
-src/e.ts:13: passthroughStream
-src/f.ts:14: passthroughStream
-src/f.ts:17: passthroughStream
-src/f.ts:20: passthroughStream
-src/f.ts:23: passthroughStream
-src/f.ts:26: passthroughStream
-src/f.ts:29: passthroughStream
 EOF
     ;;
-  find) printf 'FILES: passthroughStream.ts\nsrc/a.ts\nsrc/b.ts\n' ;;
+  find) printf 'FILES: session-store.ts\nsrc/store.ts\n' ;;
   *)    printf 'TRACE: ok\n' ;;
 esac
 exit 0
 SCRIPT
 chmod +x "$FAKE_BIN"
 
-# ── Inject only this plugin + permissions; read the active config read-only ──
+# ── Inject only this plugin (no tools.grep/tools.glob); config hook does it ──
 export OPENCODE_CONFIG_CONTENT="$(
-  printf '{"plugin":["file://%s"],"tools":{"grep":false,"glob":false}}' "$PLUGIN_DIR"
+  printf '{"plugin":["file://%s"]}' "$PLUGIN_DIR"
 )"
 export OPENCODE_PERMISSION='{"agentgrep":"allow","external_directory":"allow"}'
 export OPENCODE_SHARED_SERVER=0
+# Ignore any project-scoped config (.opencode/) so the pass is host-config
+# independent. This only disables PROJECT config — user/global config (where
+# model auth lives) is still read, so OC_SMOKE_MODEL keeps working.
+export OPENCODE_DISABLE_PROJECT_CONFIG=1
 
 export TMPDIR="$TMPSTATE"
 export AGENTGREP_BIN="$FAKE_BIN"
 export AGENTGREP_TIMEOUT_MS="${OC_SMOKE_TIMEOUT_MS:-30000}"
 export AG_SMOKE_RECORD="$RECORD"
 
-# Prompt MUST NOT name agentgrep — ask for the best repository code-search tool.
-PROMPT='Search this local repository for the exact string passthroughStream using the best available repository code-search tool. Report how many files contain it and the total number of matches.'
-
-# ── Run with a portable poll-loop watchdog ────────────────────────────────────
-timeout_secs="${OC_SMOKE_TIMEOUT:-300}"
-run_status=0
-"$OC" run --format json --print-logs --log-level DEBUG \
-  -m "$OC_SMOKE_MODEL" --dir "$WORKDIR" "$PROMPT" \
-  >"$EVENTS" 2>"$OC_LOG" &
-pid=$!
-elapsed=0
-while kill -0 "$pid" 2>/dev/null; do
-  if (( elapsed >= timeout_secs )); then
-    echo "WATCHDOG: killing oc run after ${timeout_secs}s" >&2
-    kill -9 "$pid" 2>/dev/null || true
-    run_status=137
-    break
-  fi
-  sleep 1
-  elapsed=$((elapsed + 1))
-done
-if [[ "$run_status" -eq 0 ]]; then
-  wait "$pid" || run_status=$?
-fi
-
 # Redact the real sandbox/temp/context paths from any printed diagnostics.
 redact() {
   sed -E "s#$SANDBOX#[sandbox]#g; s#$TMPSTATE#[sandbox-tmp]#g"
 }
 
-fail() {
-  echo "SMOKE-FAIL: $1" >&2
-  [[ "$run_status" -eq 137 ]] && echo "  (note: run hit the ${timeout_secs}s watchdog timeout)" >&2
-  echo "--- recorded fake-CLI invocations (redacted) ---" >&2
-  [[ -f "$RECORD" ]] && redact <"$RECORD" | sed 's/^/  /' >&2 || echo "  (no record file)" >&2
-  echo "--- oc run stderr (tail, redacted) ---" >&2
-  [[ -f "$OC_LOG" ]] && tail -n 40 "$OC_LOG" | redact | sed 's/^/  /' >&2 || true
-  echo "--- captured tool_use events (redacted) ---" >&2
-  if command -v python3 >/dev/null 2>&1; then
-    python3 - "$EVENTS" <<'PY' | redact | sed 's/^/  /' >&2 || true
-import json, sys
-for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
-    line = line.strip()
-    if not line:
-        continue
-    try:
-        ev = json.loads(line)
-    except Exception:
-        continue
-    part = None
-    if isinstance(ev, dict):
-        part = ev.get("part")
-        if part is None:
-            part = (ev.get("properties") or {}).get("part")
-    if isinstance(part, dict) and part.get("type") == "tool":
-        print(json.dumps({"tool": part.get("tool"), "input": (part.get("state") or {}).get("input")}))
-PY
-  else
-    grep -o '"tool":"[^"]*"' "$EVENTS" | sort | uniq -c | sed 's/^/  /' >&2 || true
+# ── Shared runner ────────────────────────────────────────────────────────────
+timeout_secs="${OC_SMOKE_TIMEOUT:-300}"
+run_oc() {
+  local label="$1"   # human-readable label for diagnostics
+  local prompt="$2"  # the prompt to pass to oc run
+  local events_out="$3"
+  local verdict_out="$4"
+
+  # Clear the record for this run (fresh invocation tracking).
+  : >"$RECORD"
+
+  local run_status=0
+  "$OC" run --format json --print-logs --log-level DEBUG \
+    -m "$OC_SMOKE_MODEL" --dir "$WORKDIR" "$prompt" \
+    >"$events_out" 2>"$OC_LOG" &
+  local pid=$!
+  local elapsed=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if (( elapsed >= timeout_secs )); then
+      echo "WATCHDOG [$label]: killing oc run after ${timeout_secs}s" >&2
+      kill -9 "$pid" 2>/dev/null || true
+      run_status=137
+      break
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  if [[ "$run_status" -eq 0 ]]; then
+    wait "$pid" || run_status=$?
   fi
-  exit 1
-}
 
-[[ "$run_status" -eq 0 ]] || fail "oc run exited $run_status (see stderr tail)"
-[[ -f "$EVENTS" ]] || fail "no captured events (--format json produced no output)"
+  [[ "$run_status" -eq 0 ]] || fail "[$label] oc run exited $run_status (see stderr tail)"
 
-# ── Parse the event stream ───────────────────────────────────────────────────
-if command -v python3 >/dev/null 2>&1; then
-  python3 - "$EVENTS" >"$VERDICT" <<'PY'
+  # Parse the event stream.
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$events_out" >"$verdict_out" <<'PY'
 import json, sys
 
 def tool_parts():
@@ -253,37 +221,77 @@ print("CALLMUX_USED=" + ",".join(callmux))
 print("AGENTGREP_INPUT=" + json.dumps(agentgrep_input))
 print("FINAL_TEXT=" + final_text.replace("\n", " "))
 PY
-else
-  # Minimal grep-based fallback (dedupes tool names).
-  {
-    echo "TOOLS_USED=$(grep -o '"tool":"[^"]*"' "$EVENTS" | sed 's/"tool":"//;s/"//' | sort -u | tr '\n' ',')"
-  } >"$VERDICT"
-fi
+  else
+    # Minimal grep-based fallback (dedupes tool names).
+    {
+      echo "TOOLS_USED=$(grep -o '"tool":"[^"]*"' "$events_out" | sed 's/"tool":"//;s/"//' | sort -u | tr '\n' ',')"
+    } >"$verdict_out"
+  fi
+}
 
-verdict() { grep -m1 "^$1=" "$VERDICT" | cut -d= -f2- ; }
+fail() {
+  echo "SMOKE-FAIL: $1" >&2
+  echo "--- recorded fake-CLI invocations (redacted) ---" >&2
+  [[ -f "$RECORD" ]] && redact <"$RECORD" | sed 's/^/  /' >&2 || echo "  (no record file)" >&2
+  echo "--- oc run stderr (tail, redacted) ---" >&2
+  [[ -f "$OC_LOG" ]] && tail -n 40 "$OC_LOG" | redact | sed 's/^/  /' >&2 || true
+  echo "--- captured tool_use events (redacted) ---" >&2
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$EVENTS_GREP" "$EVENTS_FIND" <<'PY' | redact | sed 's/^/  /' >&2 || true
+import json, sys
+for f in sys.argv[1:]:
+    for line in open(f, encoding="utf-8", errors="replace"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+        part = None
+        if isinstance(ev, dict):
+            part = ev.get("part")
+            if part is None:
+                part = (ev.get("properties") or {}).get("part")
+        if isinstance(part, dict) and part.get("type") == "tool":
+            print(json.dumps({"tool": part.get("tool"), "input": (part.get("state") or {}).get("input")}))
+PY
+  else
+    grep -o '"tool":"[^"]*"' "$EVENTS_GREP" "$EVENTS_FIND" 2>/dev/null | sort | uniq -c | sed 's/^/  /' >&2 || true
+  fi
+  exit 1
+}
 
-TOOLS_USED="$(verdict TOOLS_USED)"
-CODESEARCH_USED="$(verdict CODESEARCH_USED)"
-CALLMUX_USED="$(verdict CALLMUX_USED)"
-AGENTGREP_INPUT="$(verdict AGENTGREP_INPUT)"
-FINAL_TEXT="$(verdict FINAL_TEXT)"
+verdict() { grep -m1 "^$1=" "$2" | cut -d= -f2- ; }
 
-# 1 + 3. Exactly one local code-search tool_use and it is canonical agentgrep.
-[[ "$CODESEARCH_USED" == "agentgrep" ]] || fail "expected ONLY agentgrep as code-search tool use, got: $CODESEARCH_USED (all tools: $TOOLS_USED)"
+# ═══════════════════════════════════════════════════════════════════════════════
+# RUN 1: Exact lexical search (grep mode)
+# ═══════════════════════════════════════════════════════════════════════════════
+PROMPT_GREP='Search this local repository for the exact string passthroughStream using the best available repository code-search tool. Report how many files contain it and the total number of matches.'
+
+run_oc "grep" "$PROMPT_GREP" "$EVENTS_GREP" "$VERDICT_GREP"
+
+TOOLS_USED="$(verdict TOOLS_USED "$VERDICT_GREP")"
+CODESEARCH_USED="$(verdict CODESEARCH_USED "$VERDICT_GREP")"
+CALLMUX_USED="$(verdict CALLMUX_USED "$VERDICT_GREP")"
+AGENTGREP_INPUT="$(verdict AGENTGREP_INPUT "$VERDICT_GREP")"
+FINAL_TEXT="$(verdict FINAL_TEXT "$VERDICT_GREP")"
+
+# 1a. Exactly one code-search tool_use and it is canonical agentgrep.
+[[ "$CODESEARCH_USED" == "agentgrep" ]] || fail "[grep] expected ONLY agentgrep as code-search tool use, got: $CODESEARCH_USED (all tools: $TOOLS_USED)"
 
 # 3. No callmux tool/result retrieval.
-[[ -z "$CALLMUX_USED" ]] || fail "callmux tool/result retrieval occurred: $CALLMUX_USED"
+[[ -z "$CALLMUX_USED" ]] || fail "[grep] callmux tool/result retrieval occurred: $CALLMUX_USED"
 
-# 2. Input is grep mode with query/pattern passthroughStream.
+# 2a. Input is grep mode with query/pattern passthroughStream.
 MODE_OK=0
 case "$AGENTGREP_INPUT" in
   *passthroughStream*)
-    # mode may be absent (defaults to grep) or "grep".
     case "$AGENTGREP_INPUT" in
       *'"mode": "grep"'*|*'"mode":"grep"'*|*"mode: grep"*) MODE_OK=1 ;;
       *) MODE_OK=0 ;;
     esac
-    # Accept an explicit mode "grep" OR no mode at all.
+    # Accept an explicit mode "grep" OR no mode at all (defaults to grep).
     if [[ "$MODE_OK" -ne 1 ]]; then
       if [[ "$AGENTGREP_INPUT" != *'"mode"'* && "$AGENTGREP_INPUT" != *"mode:"* ]]; then
         MODE_OK=1
@@ -291,21 +299,72 @@ case "$AGENTGREP_INPUT" in
     fi
     ;;
 esac
-[[ "$MODE_OK" -eq 1 ]] || fail "agentgrep input not grep mode / passthroughStream: $AGENTGREP_INPUT"
+[[ "$MODE_OK" -eq 1 ]] || fail "[grep] agentgrep input not grep mode / passthroughStream: $AGENTGREP_INPUT"
 
-# 4. Fake binary invoked EXACTLY once, in grep subcommand.
+# 4a. Fake binary invoked EXACTLY once, in grep subcommand.
 INVOCATIONS="$(grep -c '^\[ARGV\]' "$RECORD" 2>/dev/null || true)"
-[[ "$INVOCATIONS" -eq 1 ]] || fail "fake agentgrep binary invoked $INVOCATIONS times (expected exactly 1)"
-grep -q '^\[ARGV\]	grep	' "$RECORD" || fail "fake invocation was not grep subcommand: $(grep '^\[ARGV\]' "$RECORD" | redact | head -n1)"
-grep -q 'passthroughStream' "$RECORD" || fail "fake invocation did not pass passthroughStream"
+[[ "$INVOCATIONS" -eq 1 ]] || fail "[grep] fake agentgrep binary invoked $INVOCATIONS times (expected exactly 1)"
+grep -q '^\[ARGV\]	grep	' "$RECORD" || fail "[grep] fake invocation was not grep subcommand: $(grep '^\[ARGV\]' "$RECORD" | redact | head -n1)"
+grep -q 'passthroughStream' "$RECORD" || fail "[grep] fake invocation did not pass passthroughStream"
 
-# 5. Expected result reached the model (final assistant text references it).
+# 5a. Expected result reached the model (final assistant text references it).
 case "$FINAL_TEXT" in
   *passthroughStream*) : ;;
   *"19 matches"*|*"6 files"*) : ;;
-  *) fail "expected result did not reach the model final text: $FINAL_TEXT" ;;
+  *) fail "[grep] expected result did not reach the model final text: $FINAL_TEXT" ;;
 esac
 
-echo "SMOKE-PASS: real oc run selected canonical agentgrep (grep/passthroughStream), no grep/Grep/file_grep/glob/callmux, fake invoked once, 19-matches-across-6-files result reached the model."
-echo "  tool uses (redacted): $TOOLS_USED" >&2
+echo "  [grep] PASS: exact lexical search selected canonical agentgrep, no bare grep/find/glob/Grep/file_grep/callmux, fake invoked once, 19-matches-across-6-files result reached the model." >&2
+echo "  [grep] tool uses: $TOOLS_USED" >&2
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RUN 2: Ranked file discovery (find mode)
+# ═══════════════════════════════════════════════════════════════════════════════
+PROMPT_FIND='Find files in this local repository related to session storage. Use the best available repository code-search tool with mode=find to discover relevant files and report what you find.'
+
+run_oc "find" "$PROMPT_FIND" "$EVENTS_FIND" "$VERDICT_FIND"
+
+TOOLS_USED="$(verdict TOOLS_USED "$VERDICT_FIND")"
+CODESEARCH_USED="$(verdict CODESEARCH_USED "$VERDICT_FIND")"
+CALLMUX_USED="$(verdict CALLMUX_USED "$VERDICT_FIND")"
+AGENTGREP_INPUT="$(verdict AGENTGREP_INPUT "$VERDICT_FIND")"
+FINAL_TEXT="$(verdict FINAL_TEXT "$VERDICT_FIND")"
+
+# 1b. Exactly one code-search tool_use and it is canonical agentgrep.
+[[ "$CODESEARCH_USED" == "agentgrep" ]] || fail "[find] expected ONLY agentgrep as code-search tool use, got: $CODESEARCH_USED (all tools: $TOOLS_USED)"
+
+# 3. No callmux tool/result retrieval.
+[[ -z "$CALLMUX_USED" ]] || fail "[find] callmux tool/result retrieval occurred: $CALLMUX_USED"
+
+# 2b. Input MUST have BOTH explicit mode=find AND at least one useful
+# discovery term (the prompt asks for session-storage files, so the model must
+# pass a real discovery query — not just mode=find with an empty search).
+MODE_FIND=0
+TERMS_FIND=0
+case "$AGENTGREP_INPUT" in
+  *'"mode": "find"'*|*'"mode":"find"'*|*"mode: find"*) MODE_FIND=1 ;;
+esac
+# NOTE: do NOT treat the mode value itself as a term — the mode match above is
+# the ONLY place "find" is allowed; here only real discovery terms count.
+case "$AGENTGREP_INPUT" in
+  *session*|*store*|*storage*) TERMS_FIND=1 ;;
+esac
+[[ "$MODE_FIND" -eq 1 && "$TERMS_FIND" -eq 1 ]] || fail "[find] agentgrep input must have BOTH explicit mode=find AND a useful discovery term: $AGENTGREP_INPUT"
+
+# 4b. Fake binary invoked EXACTLY once, in find subcommand.
+INVOCATIONS="$(grep -c '^\[ARGV\]' "$RECORD" 2>/dev/null || true)"
+[[ "$INVOCATIONS" -eq 1 ]] || fail "[find] fake agentgrep binary invoked $INVOCATIONS times (expected exactly 1)"
+grep -q '^\[ARGV\]	find	' "$RECORD" || fail "[find] fake invocation was not find subcommand: $(grep '^\[ARGV\]' "$RECORD" | redact | head -n1)"
+
+# 5b. Expected result reached the model.
+case "$FINAL_TEXT" in
+  *session*|*store*|*FILES*) : ;;
+  *) fail "[find] expected result did not reach the model final text: $FINAL_TEXT" ;;
+esac
+
+echo "  [find] PASS: ranked file discovery selected canonical agentgrep (mode=find), no bare find/grep/glob/Grep/file_grep/callmux, fake invoked once, discovery result reached the model." >&2
+echo "  [find] tool uses: $TOOLS_USED" >&2
+
+# ═══════════════════════════════════════════════════════════════════════════════
+echo "SMOKE-PASS: both runs passed — exact grep search and ranked find discovery both selected canonical agentgrep; no config-level tools.grep/tools.glob needed (plugin config hook did it)."
 exit 0

@@ -48,10 +48,16 @@ describe("TUI facade module shape (tui.ts)", () => {
     expect(registered).toHaveLength(1)
     const command = registered[0] as { slash?: { name?: string }; onSelect?: () => void; description?: string }
     expect(command.slash?.name).toBe("agentgrep")
-    expect(command.description ?? "").toContain("agentgrep")
+    expect(command.description ?? "").toContain("only canonical `agentgrep`")
+    expect(command.description ?? "").toContain("mode=grep|find|outline|trace")
+    expect(command.description ?? "").not.toMatch(/`find`.*shortcut/i)
     command.onSelect?.()
     expect(toasts).toHaveLength(1)
-    expect((toasts[0] as { title?: string }).title).toBe("agentgrep")
+    const toast = toasts[0] as { title?: string; message?: string }
+    expect(toast.title).toBe("agentgrep")
+    expect(toast.message ?? "").toContain("agentgrep (mode grep|find|outline|trace)")
+    expect(toast.message ?? "").toContain("Native grep/glob are replaced by default")
+    expect(toast.message ?? "").not.toMatch(/`find`.*shortcut/i)
   })
 
   test("tui() is a no-op when the legacy command API is absent", async () => {

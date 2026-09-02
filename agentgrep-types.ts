@@ -20,32 +20,52 @@
 export const AGENTGREP_CANONICAL_ID = "agentgrep"
 export const AGENTGREP_FIND_ID = "find"
 
-/** Legacy alias ids registered on the model-facing registry (exact case) when opt-in. */
-export const AGENTGREP_ALIASES: ReadonlyArray<string> = ["file_grep", "Grep"] as const
+/** Compatibility alias ids that may be registered explicitly (exact case). */
+export const AGENTGREP_ALIASES = [AGENTGREP_FIND_ID, "file_grep", "Grep"] as const
+export type AgentGrepCompatibilityAlias = (typeof AGENTGREP_ALIASES)[number]
 
 /**
- * Typed registry options for the tool builder. Passed via `buildAgentGrepTools`
- * or resolved from the `$AGENTGREP_LEGACY_ALIASES` environment variable.
+ * Portable plugin tuple options. OpenCode passes these as the plugin function's
+ * second argument. Unknown keys and malformed values are ignored.
  */
-export interface AgentGrepRegistryOptions {
+export interface AgentGrepPluginOptions {
   /**
-   * Register the legacy compatibility aliases `file_grep` and `Grep` (exact
-   * case) on the model-facing registry. Defaults to false; the default registry
-   * exposes only canonical `agentgrep` and the first-class `find` shortcut.
+   * Disable OpenCode's native `grep` and `glob` tools in the merged config.
+   * Defaults to true. Set exactly false to keep the native tools available.
    */
-  legacyAliases?: boolean
+  replaceNativeSearch?: boolean
+  /**
+   * Exact compatibility tool ids to register in addition to canonical
+   * `agentgrep`. Defaults to none; `find` is never registered implicitly.
+   */
+  compatibilityAliases?: readonly AgentGrepCompatibilityAlias[]
 }
 
-/** Resolve legacy-alias opt-in from explicit options or the env var. */
-export function legacyAliasesEnabled(opts?: AgentGrepRegistryOptions): boolean {
-  return opts?.legacyAliases === true || process.env.AGENTGREP_LEGACY_ALIASES === "1"
+export interface ResolvedAgentGrepPluginOptions {
+  replaceNativeSearch: boolean
+  compatibilityAliases: readonly AgentGrepCompatibilityAlias[]
+}
+
+/** Sanitize the untyped second plugin argument into a closed, typed policy. */
+export function sanitizeAgentGrepPluginOptions(options?: unknown): ResolvedAgentGrepPluginOptions {
+  const source = options !== null && typeof options === "object" && !Array.isArray(options)
+    ? options as Record<string, unknown>
+    : {}
+  const requested = Array.isArray(source.compatibilityAliases)
+    ? source.compatibilityAliases
+    : []
+
+  return {
+    replaceNativeSearch: source.replaceNativeSearch !== false,
+    compatibilityAliases: AGENTGREP_ALIASES.filter((alias) => requested.includes(alias)),
+  }
 }
 
 /**
  * Pure helper mirroring jcode's normalization for callers/adapters.
- * Maps grep-ish ids to the canonical tool id and the first-class `find` id to
- * itself. Returns null for unrelated ids so callers can fall through to their
- * own handling.
+ * Maps grep-ish ids to the canonical tool id and the optional compatibility
+ * `find` id to itself. Returns null for unrelated ids so callers can fall
+ * through to their own handling.
  */
 export function resolveAgentGrepToolID(id: string): string | null {
   if (id === AGENTGREP_CANONICAL_ID || id === "grep" || id === "file_grep" || id === "Grep") {

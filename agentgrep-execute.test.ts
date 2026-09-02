@@ -190,13 +190,13 @@ describe("ToolDefinition.execute smoke (fake agentgrep bin)", () => {
     }
   })
 
-  test("find: execute forces find mode, splits multiword terms, threads glob + canonical path", async () => {
+  test("find mode: execute splits multiword terms, threads glob + canonical path", async () => {
     const { ctx, asks } = makeCtx()
     try {
       fs.mkdirSync(path.join(ctx.directory, "src"), { recursive: true })
       fs.writeFileSync(harness.record, "")
       const res = asResult(
-        await tools.find.execute({ query: "session store", glob: "*.ts", path: "src" }, ctx),
+        await tools.agentgrep.execute({ mode: "find", query: "session store", glob: "*.ts", path: "src" }, ctx),
       )
       expect(res.metadata.ok).toBe(true)
       expect(res.metadata.mode).toBe("find")
@@ -220,11 +220,11 @@ describe("ToolDefinition.execute smoke (fake agentgrep bin)", () => {
     }
   })
 
-  test("find: scoped-only call (no terms) spawns with empty query positional, no throw", async () => {
+  test("find mode: scoped-only call (no terms) spawns with empty query positional, no throw", async () => {
     const { ctx } = makeCtx()
     try {
       fs.writeFileSync(harness.record, "")
-      const res = asResult(await tools.find.execute({ glob: "*.ts" }, ctx))
+      const res = asResult(await tools.agentgrep.execute({ mode: "find", glob: "*.ts" }, ctx))
       expect(res.metadata.ok).toBe(true)
       // The fake-bin tab-record drops the empty positional; the pure args test
       // proves the ["find", "", ...] bridging. Here: spawned, find mode, scope threaded.
@@ -281,14 +281,51 @@ describe("ToolDefinition.execute smoke (fake agentgrep bin)", () => {
     }
   })
 
-  test("file_grep alias (opt-in registry) executes with grep semantics", async () => {
-    const optInTools = buildAgentGrepTools(undefined, { legacyAliases: true })
+  test("explicit compatibility aliases (opt-in registry) execute with canonical mode semantics", async () => {
+    const optInTools = buildAgentGrepTools(undefined, {
+      replaceNativeSearch: true,
+      compatibilityAliases: ["find", "file_grep", "Grep"],
+    })
     const { ctx } = makeCtx()
     try {
+      // find alias → find subcommand (purpose-built forced-find ToolDefinition)
       fs.writeFileSync(harness.record, "")
-      const res = asResult(await optInTools.file_grep.execute({ query: "x" }, ctx))
-      expect(res.metadata.ok).toBe(true)
+      const findRes = asResult(await optInTools.find.execute({ query: "session" }, ctx))
+      expect(findRes.metadata.ok).toBe(true)
+      expect(findRes.metadata.mode).toBe("find")
+      expect(lastArgv()[0]).toBe("find")
+
+      // find alias FORCES find mode even when the model passes a conflicting mode
+      fs.writeFileSync(harness.record, "")
+      const forcedFindRes = asResult(
+        await optInTools.find.execute({ mode: "grep", query: "session" }, ctx),
+      )
+      expect(forcedFindRes.metadata.ok).toBe(true)
+      expect(forcedFindRes.metadata.mode).toBe("find")
+      expect(lastArgv()[0]).toBe("find")
+
+      // file_grep alias → grep subcommand (mode defaults to grep)
+      fs.writeFileSync(harness.record, "")
+      const fgRes = asResult(await optInTools.file_grep.execute({ query: "x" }, ctx))
+      expect(fgRes.metadata.ok).toBe(true)
       expect(lastArgv()[0]).toBe("grep")
+
+      // Grep alias → grep subcommand
+      fs.writeFileSync(harness.record, "")
+      const gRes = asResult(await optInTools.Grep.execute({ query: "x" }, ctx))
+      expect(gRes.metadata.ok).toBe(true)
+      expect(lastArgv()[0]).toBe("grep")
+
+      // find-only opt-in: ONLY find is added, no other aliases
+      const findOnly = buildAgentGrepTools(undefined, {
+        replaceNativeSearch: true,
+        compatibilityAliases: ["find"],
+      })
+      expect(Object.keys(findOnly)).toEqual(["agentgrep", "find"])
+      fs.writeFileSync(harness.record, "")
+      const foRes = asResult(await findOnly.find.execute({ query: "session" }, ctx))
+      expect(foRes.metadata.mode).toBe("find")
+      expect(lastArgv()[0]).toBe("find")
     } finally {
       fs.rmSync(ctx.directory, { recursive: true, force: true })
     }

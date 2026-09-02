@@ -19,13 +19,10 @@
 
 import { tool, type PluginInput, type ToolDefinition, type ToolContext, type ToolResult } from "@opencode-ai/plugin"
 import path from "node:path"
-import type { AgentGrepInput, AgentGrepMode } from "./agentgrep-types"
+import type { AgentGrepInput, AgentGrepMode, AgentGrepCompatibilityAlias, ResolvedAgentGrepPluginOptions } from "./agentgrep-types"
 import {
   AGENTGREP_CANONICAL_ID,
-  AGENTGREP_FIND_ID,
-  legacyAliasesEnabled,
   normalizeAgentGrepMode,
-  type AgentGrepRegistryOptions,
 } from "./agentgrep-types"
 import { buildAgentGrepArgs, exactFileScope, operationPatterns } from "./agentgrep-args"
 import { askExternalDirectoryIfNeeded, canonicalizePath, resolveModelRoots } from "./agentgrep-paths"
@@ -42,8 +39,7 @@ function toolDescription(alias: string | null): string {
   const modes =
     `Modes: "grep" (exact search), "outline" (structure scan of a known file, ` +
     `requires \`file\`), "trace" (structured investigation with ranked files+regions). ` +
-    `It can also do ranked file discovery with mode="find", but the dedicated \`find\` ` +
-    `tool is the preferred shortcut for that.`
+    `It can also do ranked file discovery with mode="find".`
   const schema =
     `Args follow the jcode-compatible public schema: \`query\`, \`file\`, \`terms\`, ` +
     `\`regex\`, \`path\`, \`glob\`, \`type\`, \`max_files\`, \`max_regions\`, \`paths_only\`. ` +
@@ -54,25 +50,11 @@ function toolDescription(alias: string | null): string {
     `output is capped (default 200000 chars) and runs are killed after a default 30s timeout.`
   const note =
     alias === "file_grep" || alias === "Grep"
-      ? ` Compatibility-only legacy alias for the canonical \`agentgrep\` tool. Prefer \`agentgrep\`.`
-      : ""
+      ? ` Compatibility-only alias for the canonical \`agentgrep\` tool. Use \`agentgrep\` with mode="grep" for exact search.`
+      : alias === "find"
+        ? ` Compatibility-only alias for the canonical \`agentgrep\` tool. Use \`agentgrep\` with mode="find" for ranked file discovery.`
+        : ""
   return [header, modes, schema, note.split("\n").join(" ")].filter(Boolean).join("\n\n")
-}
-
-function findToolDescription(): string {
-  return (
-    `Ranked file discovery over the current repository using the agentgrep CLI (v0.1.6) ` +
-    `\`find\` mode. Use this tool ONLY for ranked file discovery ("find the file that..."). ` +
-    `For exact search, file outlines, or traces use the canonical \`agentgrep\` tool instead ` +
-    `(agentgrep can also do ranked discovery with mode=find). Results are ranked candidate ` +
-    `files matching the given terms, optionally narrowed by \`glob\` / \`type\` / \`max_files\`. ` +
-    `This is the model-facing replacement for the disabled native \`glob\` tool. ` +
-    `A file-valued \`path\` scopes discovery to that exact file. \`path\` defaults to ` +
-    `the current project directory; relative paths resolve against it. Paths outside ` +
-    `the project require external_directory permission. Results are bounded CLI-side ` +
-    `(max-files default 10), output is capped (default 200000 chars), and runs are ` +
-    `killed after a default 30s timeout.`
-  )
 }
 
 /**
@@ -95,14 +77,13 @@ function findToolDescription(): string {
  * args builder so `smart` + multiword `query` still splits into trace DSL terms
  * inside buildAgentGrepArgs/operationPatterns, while the CLI subcommand is
  * resolved to `trace`. `resolvedMode` (smart → trace) is used only for
- * metadata and find-forcing; it does NOT overwrite the raw mode.
+ * metadata; it does NOT overwrite the raw mode.
  */
 async function executeAgentGrep(
   input: Record<string, any>,
   ctx: ToolContext,
   resolvedMode: AgentGrepMode,
   provider: AgentGrepContextProvider,
-  forceMode?: AgentGrepMode,
 ): Promise<ToolResult> {
   const title = `agentgrep ${resolvedMode}`
   const roots = resolveModelRoots(input, resolvedMode, ctx.directory)
@@ -130,9 +111,8 @@ async function executeAgentGrep(
     sanitizeContextOutput(text, { tempPath: contextTemp?.path ?? null, contextJson })
   try {
     // Keep the RAW caller mode so smart query-splitting survives into the args
-    // builder; only a forced-mode tool (the `find` id) pins the mode here.
+    // builder; the mode is resolved per-call, never pinned by the tool id.
     normalized = { ...input }
-    if (forceMode) normalized.mode = forceMode
 
     if (roots.path?.isExactFile) {
       const scope = exactFileScope(roots.path.full, roots.path.kind)
@@ -331,12 +311,22 @@ function buildTool(alias: string | null, provider: AgentGrepContextProvider): To
 }
 
 /**
- * The first-class `find` id: forces agentgrep `find` mode regardless of any
- * `mode` the model passes.
+ * The explicit compatibility `find` alias: a purpose-built ToolDefinition that
+ * FORCES agentgrep `find` mode regardless of any `mode` the model passes
+ * (matching the historical first-class `find` behavior). Registered ONLY when
+ * `compatibilityAliases` includes "find" — never by default.
  */
 function buildFindTool(provider: AgentGrepContextProvider): ToolDefinition {
   return tool({
-    description: findToolDescription(),
+    description:
+      `Compatibility-only alias for the canonical \`agentgrep\` tool. Use \`agentgrep\` ` +
+      `with mode="find" for ranked file discovery. This id forces agentgrep \`find\` mode ` +
+      `regardless of any \`mode\` input. Results are ranked candidate files matching the ` +
+      `given terms, optionally narrowed by \`glob\` / \`type\` / \`max_files\`. A file-valued ` +
+      `\`path\` scopes discovery to that exact file. \`path\` defaults to the current project ` +
+      `directory; relative paths resolve against it. Paths outside the project require ` +
+      `external_directory permission. Results are bounded CLI-side (max-files default 10), ` +
+      `output is capped (default 200000 chars), and runs are killed after a default 30s timeout.`,
     args: {
       query: tool.schema
         .string()
@@ -372,7 +362,9 @@ function buildFindTool(provider: AgentGrepContextProvider): ToolDefinition {
         .describe("Return only matching paths instead of match excerpts where supported."),
     },
     execute: async (input: Record<string, any>, ctx: ToolContext): Promise<ToolResult> => {
-      return executeAgentGrep(input, ctx, "find", provider, "find")
+      // Pin the RAW mode to "find" so buildAgentGrepArgs/operationPatterns emit
+      // find argv/patterns even if the model passed a different mode.
+      return executeAgentGrep({ ...input, mode: "find" }, ctx, "find", provider)
     },
   })
 }
@@ -381,13 +373,18 @@ function buildFindTool(provider: AgentGrepContextProvider): ToolDefinition {
  * Build the registry of tool definitions.
  *
  * Default: canonical `agentgrep` (mode-flexible, the primary local code-search
- * tool) and the first-class `find` id (forced find mode, the ranked file-
- * discovery shortcut). Legacy compatibility aliases `file_grep`/`Grep` are
- * registered ONLY when `opts.legacyAliases === true` (or the env var
- * `AGENTGREP_LEGACY_ALIASES=1` is set). NOTE: intentionally NO `grep` id and
- * NO `glob` id — the permission gate `tools.grep=false` / `tools.glob=false`
- * filters any tool with those ids, so grep/glob-id plugin aliases would be
- * unreachable and would silently never fire.
+ * tool with modes grep/find/outline/trace). Compatibility aliases (`find`,
+ * `file_grep`, `Grep` — exact case) are registered ONLY when explicitly
+ * requested through `opts.compatibilityAliases`; `find` is never registered
+ * implicitly. The `find` alias is a purpose-built, forced-find ToolDefinition
+ * (see buildFindTool); `file_grep`/`Grep` reuse the mode-flexible schema.
+ * NOTE: intentionally NO `grep` id and NO `glob` id — the config
+ * hook disables OpenCode's native grep/glob tools, so grep/glob-id plugin
+ * aliases would be unreachable and would silently never fire.
+ *
+ * `opts` is the ALREADY-SANITIZED policy from `sanitizeAgentGrepPluginOptions`
+ * (see agentgrep-types.ts); pass the raw plugin tuple through that sanitizer
+ * first. Omitted → default policy (no aliases).
  *
  * `pluginInput` is threaded from the loader so the shared harness context
  * adapter can feature-detect the injected SDK client and (lazily) a v2 client
@@ -397,16 +394,18 @@ function buildFindTool(provider: AgentGrepContextProvider): ToolDefinition {
  */
 export function buildAgentGrepTools(
   pluginInput?: PluginInput,
-  opts?: AgentGrepRegistryOptions,
+  opts?: ResolvedAgentGrepPluginOptions,
 ): Record<string, ToolDefinition> {
   const provider = createAgentGrepContextProvider(pluginInput)
   const tools: Record<string, ToolDefinition> = {
     [AGENTGREP_CANONICAL_ID]: buildTool(null, provider),
-    [AGENTGREP_FIND_ID]: buildFindTool(provider),
   }
-  if (legacyAliasesEnabled(opts)) {
-    tools["file_grep"] = buildTool("file_grep", provider)
-    tools["Grep"] = buildTool("Grep", provider)
+  for (const alias of opts?.compatibilityAliases ?? []) {
+    if (alias === "find") {
+      tools[alias] = buildFindTool(provider)
+    } else {
+      tools[alias] = buildTool(alias, provider)
+    }
   }
   return tools
 }

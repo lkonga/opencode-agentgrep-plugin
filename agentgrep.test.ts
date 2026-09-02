@@ -13,18 +13,17 @@ import path from "node:path"
 import {
   AGENTGREP_ALIASES,
   AGENTGREP_CANONICAL_ID,
-  AGENTGREP_FIND_ID,
   AGENTGREP_GUIDANCE_MARKER,
   agentgrepSystemGuidance,
   applyAgentGrepSystemGuidance,
   buildAgentGrepArgs,
   buildAgentGrepTools,
   exactFileScope,
-  legacyAliasesEnabled,
   normalizeAgentGrepMode,
   normalizeMatchAllGlob,
   operationPatterns,
   resolveAgentGrepToolID,
+  sanitizeAgentGrepPluginOptions,
   tryResolveAgentGrepBin,
   agentGrepDefaultBin,
 } from "./agentgrep-core"
@@ -56,13 +55,62 @@ describe("entrypoint module shape (loader constraint)", () => {
     expect(typeof mod.default).toBe("function")
   })
 
-  test("default plugin registers canonical agentgrep + find only (no bare grep/glob, no legacy aliases)", async () => {
+  test("default plugin registers canonical agentgrep ONLY (no find/grep/glob/compat ids)", async () => {
     const hooks = await agentGrepPlugin(makePluginInput())
-    expect(Object.keys(hooks.tool)).toEqual(["agentgrep", "find"])
+    expect(Object.keys(hooks.tool)).toEqual(["agentgrep"])
     for (const id of Object.keys(hooks.tool)) {
       expect(hooks.tool[id].description).toContain("agentgrep")
       expect(typeof hooks.tool[id].execute).toBe("function")
     }
+  })
+
+  test("default plugin config hook disables native grep/glob while preserving unrelated config", async () => {
+    const hooks = await agentGrepPlugin(makePluginInput())
+    const config: Record<string, any> = { tools: { read: true, bash: true } }
+    hooks.config?.(config)
+    expect(config.tools.grep).toBe(false)
+    expect(config.tools.glob).toBe(false)
+    // unrelated tool settings survive the deep-merged config hook
+    expect(config.tools.read).toBe(true)
+    expect(config.tools.bash).toBe(true)
+  })
+
+  test("config hook creates tools when absent (defaults replaceNativeSearch=true)", async () => {
+    const hooks = await agentGrepPlugin(makePluginInput())
+    const config: Record<string, any> = {}
+    hooks.config?.(config)
+    expect(config.tools).toEqual({ grep: false, glob: false })
+  })
+
+  test("replaceNativeSearch:false skips config mutation entirely (native tools preserved)", async () => {
+    const hooks = await agentGrepPlugin(makePluginInput(), { replaceNativeSearch: false })
+    const config: Record<string, any> = { tools: { grep: true, glob: true, read: false } }
+    hooks.config?.(config)
+    // untouched: grep/glob keep their user-configured values, nothing else is added
+    expect(config.tools.grep).toBe(true)
+    expect(config.tools.glob).toBe(true)
+    expect(config.tools.read).toBe(false)
+    expect(Object.keys(config.tools)).toEqual(["grep", "glob", "read"])
+  })
+
+  test("replaceNativeSearch:false preserves unrelated config entries exactly", async () => {
+    const hooks = await agentGrepPlugin(makePluginInput(), { replaceNativeSearch: false })
+    const config: Record<string, any> = { tools: { bash: "ask" }, permission: { bash: "ask" } }
+    hooks.config?.(config)
+    expect(config.tools).toEqual({ bash: "ask" })
+    expect(config.permission).toEqual({ bash: "ask" })
+  })
+
+  test("tuple options control aliases independently from the native opt-out", async () => {
+    // aliases can be requested while replaceNativeSearch:false keeps native tools
+    const hooks = await agentGrepPlugin(makePluginInput(), {
+      replaceNativeSearch: false,
+      compatibilityAliases: ["find"],
+    })
+    expect(Object.keys(hooks.tool)).toEqual(["agentgrep", "find"])
+    const config: Record<string, any> = { tools: { grep: true } }
+    hooks.config?.(config)
+    expect(config.tools.grep).toBe(true) // native opt-out still skipped
   })
 
   test("default plugin exposes the idempotent local code-search system guidance hook", async () => {
@@ -81,7 +129,10 @@ describe("entrypoint module shape (loader constraint)", () => {
 
 describe("tool registration ids", () => {
   const tools = buildAgentGrepTools()
-  const optInTools = buildAgentGrepTools(undefined, { legacyAliases: true })
+  const optInTools = buildAgentGrepTools(undefined, {
+    replaceNativeSearch: true,
+    compatibilityAliases: ["find", "file_grep", "Grep"],
+  })
 
   test("canonical agentgrep is registered", () => {
     expect(Object.keys(tools)).toContain(AGENTGREP_CANONICAL_ID)
@@ -90,40 +141,43 @@ describe("tool registration ids", () => {
     expect(tools.agentgrep.args).toBeTruthy()
   })
 
-  test("legacy aliases are NOT registered by default, but ARE via the typed opt-in (exact case)", () => {
-    // Default registry: no legacy aliases.
+  test("compatibility aliases are NOT registered by default, but ARE via the explicit typed opt-in (exact case)", () => {
+    // Default registry: exactly one canonical tool — no aliases at all.
     for (const alias of AGENTGREP_ALIASES) {
       expect(Object.keys(tools), `${alias} must be absent by default`).not.toContain(alias)
     }
-    // Typed opt-in registers BOTH exact-case ids.
+    // Explicit opt-in registers EVERY requested exact-case id (incl. find).
     for (const alias of AGENTGREP_ALIASES) {
       expect(Object.keys(optInTools)).toContain(alias)
       expect(optInTools[alias].description).toContain("agentgrep")
-      expect(optInTools[alias].description).toMatch(/compatibilit|Prefer/i)
+      expect(optInTools[alias].description).toMatch(/compatibilit/i)
       expect(typeof optInTools[alias].execute).toBe("function")
     }
   })
 
-  test("AGENTGREP_LEGACY_ALIASES=1 env opt-in registers the exact-case legacy aliases", () => {
-    const prev = process.env.AGENTGREP_LEGACY_ALIASES
-    try {
-      process.env.AGENTGREP_LEGACY_ALIASES = "1"
-      const envTools = buildAgentGrepTools()
-      expect(Object.keys(envTools)).toEqual(["agentgrep", "find", "file_grep", "Grep"])
-      expect(legacyAliasesEnabled()).toBe(true)
-    } finally {
-      if (prev === undefined) delete process.env.AGENTGREP_LEGACY_ALIASES
-      else process.env.AGENTGREP_LEGACY_ALIASES = prev
-    }
-    expect(legacyAliasesEnabled()).toBe(false)
-  })
-
-  test("first-class find id is registered with forced find semantics", () => {
-    expect(Object.keys(tools)).toContain(AGENTGREP_FIND_ID)
-    const findTool = tools.find
-    expect(findTool.description).toContain("find")
-    // find args carry no mode; the id itself forces find mode.
-    expect(Object.keys(findTool.args ?? {})).not.toContain("mode")
+  test("find is registered ONLY when explicitly requested (never first-class)", () => {
+    expect(Object.keys(tools)).not.toContain("find")
+    const findOnly = buildAgentGrepTools(undefined, {
+      replaceNativeSearch: true,
+      compatibilityAliases: ["find"],
+    })
+    expect(Object.keys(findOnly)).toEqual(["agentgrep", "find"])
+    // The find alias is a purpose-built, forced-find tool: its schema has NO
+    // mode arg (the id itself pins find mode), unlike file_grep/Grep which
+    // reuse the mode-flexible canonical schema.
+    expect(Object.keys(findOnly.find.args ?? {})).not.toContain("mode")
+    expect(Object.keys(findOnly.find.args ?? {})).toEqual([
+      "query",
+      "terms",
+      "path",
+      "glob",
+      "type",
+      "max_files",
+      "paths_only",
+    ])
+    expect(findOnly.find.description).toMatch(/compatibilit/i)
+    expect(findOnly.find.description).toMatch(/mode="find"/)
+    expect(findOnly.find.description).toMatch(/forces/i)
   })
 
   test("grep id AND glob id are deliberately ABSENT (default and opt-in)", () => {
@@ -133,7 +187,7 @@ describe("tool registration ids", () => {
       expect(Object.keys(registry)).not.toContain("grep")
       expect(Object.keys(registry)).not.toContain("glob")
     }
-    expect(Object.keys(tools)).toEqual(["agentgrep", "find"])
+    expect(Object.keys(tools)).toEqual(["agentgrep"])
     expect(Object.keys(optInTools)).toEqual(["agentgrep", "find", "file_grep", "Grep"])
   })
 
@@ -152,6 +206,57 @@ describe("tool registration ids", () => {
         expect(isZodV4Shape(shape), `${id}.args.${name} must be a zod v4 shape`).toBe(true)
       }
     }
+  })
+})
+
+// ── Plugin option sanitization (portable tuple policy) ───────────────────────
+
+describe("sanitizeAgentGrepPluginOptions (portable tuple policy)", () => {
+  test("undefined / null / non-object options default to replaceNativeSearch + no aliases", () => {
+    for (const bad of [undefined, null, 42, "grep", true]) {
+      const s = sanitizeAgentGrepPluginOptions(bad)
+      expect(s.replaceNativeSearch).toBe(true)
+      expect(s.compatibilityAliases).toEqual([])
+    }
+  })
+
+  test("replaceNativeSearch defaults to true unless exactly false", () => {
+    expect(sanitizeAgentGrepPluginOptions({}).replaceNativeSearch).toBe(true)
+    expect(sanitizeAgentGrepPluginOptions({ replaceNativeSearch: false }).replaceNativeSearch).toBe(false)
+    expect(sanitizeAgentGrepPluginOptions({ replaceNativeSearch: true }).replaceNativeSearch).toBe(true)
+    // malformed values are ignored (default true), never coerced
+    expect(sanitizeAgentGrepPluginOptions({ replaceNativeSearch: "no" }).replaceNativeSearch).toBe(true)
+    expect(sanitizeAgentGrepPluginOptions({ replaceNativeSearch: 0 }).replaceNativeSearch).toBe(true)
+  })
+
+  test("compatibilityAliases keeps only exact-case known ids, in canonical order", () => {
+    const s = sanitizeAgentGrepPluginOptions({
+      compatibilityAliases: ["find", "file_grep", "Grep"],
+    })
+    expect(s.compatibilityAliases).toEqual(["find", "file_grep", "Grep"])
+  })
+
+  test("unknown / malformed aliases are dropped; non-array values are ignored", () => {
+    expect(sanitizeAgentGrepPluginOptions({ compatibilityAliases: ["find", "glob", "grep", "bogus"] }).compatibilityAliases).toEqual(["find"])
+    expect(sanitizeAgentGrepPluginOptions({ compatibilityAliases: "find" }).compatibilityAliases).toEqual([])
+    expect(sanitizeAgentGrepPluginOptions({ compatibilityAliases: [42, null] }).compatibilityAliases).toEqual([])
+  })
+
+  test("duplicates collapse; order follows the canonical AGENTGREP_ALIASES order", () => {
+    const s = sanitizeAgentGrepPluginOptions({ compatibilityAliases: ["Grep", "find", "find", "file_grep"] })
+    expect(s.compatibilityAliases).toEqual(["find", "file_grep", "Grep"])
+  })
+
+  test("find-only opt-in is supported and never drags in other aliases", () => {
+    const s = sanitizeAgentGrepPluginOptions({ compatibilityAliases: ["find"] })
+    expect(s.compatibilityAliases).toEqual(["find"])
+  })
+
+  test("sanitized options drive buildAgentGrepTools identically", () => {
+    const raw = { replaceNativeSearch: false, compatibilityAliases: ["find", "file_grep", "Grep"] }
+    const resolved = sanitizeAgentGrepPluginOptions(raw)
+    const registry = buildAgentGrepTools(undefined, resolved)
+    expect(Object.keys(registry)).toEqual(["agentgrep", "find", "file_grep", "Grep"])
   })
 })
 
@@ -210,8 +315,22 @@ describe("public schema parity (jcode-compatible surface)", () => {
     expect(values).not.toContain("smart")
   })
 
-  test("first-class find tool exposes the find-relevant public subset (no mode)", () => {
-    expect(Object.keys(tools.find.args ?? {})).toEqual([
+  test("no default find/grep/glob/Grep/file_grep ids expose any schema", () => {
+    // With no compatibility aliases requested the default registry has exactly
+    // ONE id, so no other schema can ever be selected by the model.
+    expect(Object.keys(tools)).toEqual(["agentgrep"])
+  })
+
+  test("explicit find alias carries the purpose-built forced-find schema (no mode arg)", () => {
+    const findOnly = buildAgentGrepTools(undefined, {
+      replaceNativeSearch: true,
+      compatibilityAliases: ["find"],
+    })
+    const keys = Object.keys(findOnly.find.args ?? {})
+    // The find alias is a purpose-built ToolDefinition with a forced-find
+    // schema — no mode arg (the id itself pins find mode).
+    expect(keys).not.toContain("mode")
+    expect(keys).toEqual([
       "query",
       "terms",
       "path",
@@ -246,7 +365,10 @@ describe("resolveAgentGrepToolID (jcode mirror)", () => {
 
 describe("tool descriptions are unambiguous for tool selection", () => {
   const tools = buildAgentGrepTools()
-  const optInTools = buildAgentGrepTools(undefined, { legacyAliases: true })
+  const optInTools = buildAgentGrepTools(undefined, {
+    replaceNativeSearch: true,
+    compatibilityAliases: ["find", "file_grep", "Grep"],
+  })
 
   test("canonical agentgrep description covers grep/outline/trace and mode=find", () => {
     const d = tools.agentgrep.description
@@ -257,18 +379,20 @@ describe("tool descriptions are unambiguous for tool selection", () => {
     expect(d).toMatch(/canonical/i)
   })
 
-  test("find description is scoped to ranked file discovery only", () => {
-    const d = tools.find.description
-    expect(d).toContain("ranked file discovery")
-    expect(d).toContain("ONLY")
-    expect(d).toContain("agentgrep")
+  test("canonical agentgrep description no longer recommends a dedicated find shortcut", () => {
+    const d = tools.agentgrep.description
+    expect(d).not.toMatch(/dedicated.*find/i)
+    expect(d).not.toMatch(/preferred shortcut/i)
   })
 
-  test("legacy alias descriptions (opt-in) state compatibility-only / prefer agentgrep", () => {
+  test("explicit compatibility alias descriptions state compatibility-only + point at canonical mode", () => {
     for (const alias of AGENTGREP_ALIASES) {
       const d = optInTools[alias].description
       expect(d).toMatch(/compatibilit/i)
-      expect(d).toMatch(/prefer.*agentgrep/i)
+      expect(d).toMatch(/canonical `agentgrep` tool/i)
+      // aliases point at the canonical mode that matches their role
+      if (alias === "find") expect(d).toMatch(/mode="find"/)
+      if (alias === "file_grep" || alias === "Grep") expect(d).toMatch(/mode="grep"/)
     }
   })
 })
@@ -284,6 +408,7 @@ describe("local code-search system guidance", () => {
     expect(text).toMatch(/local repository/i)
     // Forbidden / compatibility ids must never be RECOMMENDED.
     expect(text).toMatch(/never call tools\s+named/i)
+    expect(text).toContain("`find`")
     expect(text).toContain("`grep`")
     expect(text).toContain("`glob`")
     expect(text).toContain("`Grep`")
