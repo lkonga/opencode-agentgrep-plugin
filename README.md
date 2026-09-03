@@ -333,24 +333,32 @@ ssh g5kc 'cd /tmp/opencode-agentgrep-verify && bun install && bun test && bunx t
 - `bunx tsc --noEmit` — strict typecheck over entry, sources, tests.
 - `bash -n scripts/*.sh` — shell lint on installer + smokes.
 
-**End-to-end smokes** (real `oc run`, requires a configured model; set
-`OC_SMOKE_MODEL`, e.g. `codex-omniroute/om-cx-gpt-5.6-sol-fast`; exit 2 SKIP
-when unset, 0 pass, 1 fail):
+**End-to-end smokes** (real `oc run`; exit 0 pass, 1 fail, 2 SKIP when a
+required model is unset):
 
 ```bash
-OC_SMOKE_MODEL=provider/model bash scripts/smoke-oc-context.sh     # harness context E2E
-OC_SMOKE_MODEL=provider/model bash scripts/smoke-oc-selection.sh   # tool-selection E2E
+OC_SMOKE_MODEL=provider/model bash scripts/smoke-oc-context.sh     # harness-context E2E (real model, active credentials)
+bash scripts/smoke-oc-selection.sh                                 # deterministic, self-contained selection smoke (no model needed)
 ```
 
-- **`smoke-oc-context.sh`** proves `--context-json` is passed to the CLI, the
-  file is valid JSON + mode 0600 at runtime, it is copied before cleanup, the
-  tempdir is removed, and exact-file containment holds while context is
+- **`smoke-oc-context.sh`** (requires `OC_SMOKE_MODEL` and active
+  model/provider credentials) proves `--context-json` is passed to the CLI,
+  the file is valid JSON + mode 0600 at runtime, it is copied before cleanup,
+  the tempdir is removed, and exact-file containment holds while context is
   present (file-scoped trace argv still `--path <parent> --glob <basename>`).
-- **`smoke-oc-selection.sh`** (two runs: exact grep + ranked find) proves:
-  every local code-search call is canonical `agentgrep` with the phase's mode
-  (grep, or explicit find) and ≥1 call carries the phase's expected
-  query/terms; local-search calls per run are bounded (1..`OC_SMOKE_MAX_CALLS`,
-  default **8**) as a deterministic loop sanity check; no bare
+- **`smoke-oc-selection.sh`** (two runs: exact grep + ranked find) is
+  **deterministic and self-contained**: it owns a script-local
+  OpenAI-compatible **capture** model/server, so no `OC_SMOKE_MODEL` or active
+  provider credentials are needed. It still runs two **real, fresh** `oc run`s
+  and inspects the **actual outbound main-model request payload** (captured on
+  the local server): canonical `agentgrep` must be present while native
+  `grep`/`glob` — and the forbidden **compatibility search IDs** (`find`,
+  `file_grep`, `Grep`) — are absent; the captured responses return
+  **deterministic** agentgrep tool calls for explicit `mode=grep` and
+  `mode=find`; every local code-search call is canonical `agentgrep` with the
+  phase's mode and ≥1 call carries the phase's expected query/terms;
+  local-search calls per run are bounded (1..`OC_SMOKE_MAX_CALLS`, default
+  **8**) as a deterministic loop sanity check; no bare
   `find`/`grep`/`glob`/`Grep`/`file_grep`, no callmux, and **no shell
   bypass** (`bash` commands invoking `rg`/`grep`/`find`); the controlled fake
   CLI runs ≥1 and ≤`OC_SMOKE_MAX_CALLS` times with phase-matching
@@ -358,19 +366,25 @@ OC_SMOKE_MODEL=provider/model bash scripts/smoke-oc-selection.sh   # tool-select
   on injecting `tools.grep`/`tools.glob` — the plugin's config hook does the
   replacement.
 
-Smoke knobs: `OC_SMOKE_MODEL` (required), `OC_SMOKE_TIMEOUT` (default `300`),
-`OC_SMOKE_TIMEOUT_MS` (CLI run timeout for the fake binary),
-`OC_SMOKE_MAX_CALLS` (default `8`, selection smoke), `OC_SMOKE_KEEP_SANDBOX=1`
-(leave the sandbox for inspection).
+Smoke knobs — **context**: `OC_SMOKE_MODEL` (required), `OC_SMOKE_TIMEOUT`
+(default `300`). **Selection**: `OC_SMOKE_TIMEOUT` (default `300`),
+`OC_SMOKE_TIMEOUT_MS` (fake agentgrep CLI timeout, default `30000`),
+`OC_SMOKE_MAX_CALLS` (default `8`), `OC_SMOKE_PREFLIGHT_PORT` (optional
+registry-preflight override; otherwise collision-safe), and
+`OC_SMOKE_KEEP_SANDBOX=1` (leave the sandbox for inspection).
 
-**The smokes are NOT hermetic by design.** Each runs a real `oc run` against
-the **active** OpenCode config, reading provider/credential config **read-only**
-and injecting only the plugin + permissions via
-`OPENCODE_CONFIG_CONTENT`/`OPENCODE_PERMISSION` (never mutating config files;
-a fresh in-process server, `OPENCODE_SHARED_SERVER=0`, so the plugin loads
-with the run's env). A throwaway session in the normal data store is the
-inherent cost of a real `oc run`; real sandbox paths are redacted from
-diagnostics.
+**Hermeticity.** `smoke-oc-context.sh` is **not hermetic by design**: it runs
+a real `oc run` against the **active** OpenCode config and needs live
+model/provider credentials (`OC_SMOKE_MODEL`). `smoke-oc-selection.sh` is
+**hermetic**: no external provider or credential use — it serves its own local
+OpenAI-compatible capture model/server — though it still starts a fresh real
+OpenCode server/run, so a throwaway session in the normal data store remains
+the inherent cost of a real `oc run`. Both inject configuration without
+mutating config files and use a fresh in-process server
+(`OPENCODE_SHARED_SERVER=0`) so the plugin loads with the run's environment.
+The selection smoke puts its controlled permissions in
+`OPENCODE_CONFIG_CONTENT` and unsets ambient `OPENCODE_PERMISSION`; real
+sandbox paths are redacted from diagnostics.
 
 ## Disabling and uninstalling
 

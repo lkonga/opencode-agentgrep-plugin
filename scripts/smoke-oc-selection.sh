@@ -5,10 +5,10 @@
 # file_grep / callmux) for BOTH (a) exact lexical search (mode=grep) and
 # (b) ranked file discovery (mode=find).
 #
-# To run it deterministically you must force a real model:
-#     OC_SMOKE_MODEL=provider/model bash scripts/smoke-oc-selection.sh
-# (e.g. OC_SMOKE_MODEL=codex-omniroute/om-cx-gpt-5.6-sol-fast). If OC_SMOKE_MODEL
-# is unset the script SKIPS (exit 2) with a clear message.
+# It uses a deterministic local OpenAI-compatible HTTP capture server (Python 3)
+# instead of a live remote model. The capture server records every outbound
+# request body to JSONL so the script can later assert the exact tool payload:
+# canonical agentgrep exactly once, native grep/glob absent from the request.
 #
 # What it proves (TWO sequential oc runs):
 #   1. Run 1 (exact grep): at least one code-search tool_use and EVERY one is
@@ -28,17 +28,26 @@
 #   6. The expected result reaches the model in each run.
 #   7. Pass does not rely on config-level native-tool disables; the plugin's
 #      replacement policy and event-stream assertions remain authoritative.
+#   8. Authoritative request-payload assertion per phase — the captured
+#      HTTP request JSON is inspected to prove the canonical agentgrep tool is
+#      offered exactly once, and native grep/glob are absent from the tool
+#      payload (unlike the /experimental/tool/ids registry which always
+#      advertises them).
 #
 # Host-environment notes:
 #   - Uses a CONTROLLED FAKE agentgrep binary via AGENTGREP_BIN.
 #   - Uses a FRESH in-process server (OPENCODE_SHARED_SERVER=0).
-#   - READS the ACTIVE OPENCODE_CONFIG_DIR / provider config / credentials
-#     read-only and injects ONLY this plugin (OPENCODE_CONFIG_CONTENT).
+#   - Uses a DETERMINISTIC LOCAL CAPTURE LLM (Python 3 HTTP server) instead of
+#     any live remote model. No secrets, no network egress, no provider config
+#     read from the user's environment.
+#   - Injects only this plugin, a controlled provider, and controlled permissions
+#     through OPENCODE_CONFIG_CONTENT; ambient OPENCODE_PERMISSION is unset.
 #     Does NOT touch XDG_DATA_HOME / OPENCODE_DATA_HOME / OPENCODE_CONFIG_DIR.
 #   - Capture is `oc run --format json`; diagnostics are redacted.
 #   - Portable poll-loop watchdog (no blocked external `timeout` wrapper).
+#   - Capture LLM logs outbound request bodies to JSONL for payload assertion.
 #
-# Requirements: a working `oc`, the plugin checkout, and a configured model.
+# Requirements: a working `oc`, the plugin checkout, and Python 3.
 
 set -euo pipefail
 
@@ -46,10 +55,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PLUGIN_DIR="$ROOT"
 OC="${OC:-oc}"
 
-if [[ -z "${OC_SMOKE_MODEL:-}" ]]; then
-  echo "SKIP (exit 2): OC_SMOKE_MODEL is not set." >&2
-  echo "  Set OC_SMOKE_MODEL=provider/model (e.g. codex-omniroute/om-cx-gpt-5.6-sol-fast) to run this smoke." >&2
-  exit 2
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "ERROR: python3 is required for the local capture LLM server." >&2
+  exit 1
 fi
 
 if ! command -v "$OC" >/dev/null 2>&1; then
@@ -81,8 +89,37 @@ EVENTS_FIND="$SANDBOX/events-find.jsonl"
 VERDICT_GREP="$SANDBOX/verdict-grep.txt"
 VERDICT_FIND="$SANDBOX/verdict-find.txt"
 OC_LOG="$SANDBOX/oc.log"
+CAPTURE_DIR="$SANDBOX/capture"
+CAPTURE_LOG="$CAPTURE_DIR/requests.jsonl"
+CAPTURE_PID_FILE="$CAPTURE_DIR/server.pid"
+CAPTURE_PORT_FILE="$CAPTURE_DIR/server.port"
+PREFLIGHT_PID=""
+RUN_PID=""
+
+stop_group() {
+  local pid="${1:-}"
+  [[ -n "$pid" ]] || return 0
+  kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+  for _ in $(seq 1 20); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
 
 cleanup() {
+  stop_group "$RUN_PID"
+  stop_group "$PREFLIGHT_PID"
+  # Stop the capture server first.
+  if [[ -f "$CAPTURE_PID_FILE" ]]; then
+    local cpid
+    cpid="$(cat "$CAPTURE_PID_FILE" 2>/dev/null || true)"
+    if [[ -n "$cpid" ]]; then
+      kill "$cpid" 2>/dev/null || true
+      wait "$cpid" 2>/dev/null || true
+    fi
+  fi
   if [[ "${OC_SMOKE_KEEP_SANDBOX:-0}" == "1" ]]; then
     echo "NOTE: OC_SMOKE_KEEP_SANDBOX=1 — sandbox left at $SANDBOX" >&2
     return
@@ -91,7 +128,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "$WORKDIR" "$WORKDIR/src" "$TMPSTATE"
+mkdir -p "$WORKDIR" "$WORKDIR/src" "$TMPSTATE" "$CAPTURE_DIR"
 
 # Workspace with files for BOTH grep and find scenarios.
 printf 'export const passthroughStream = 1\n' >"$WORKDIR/passthroughStream.ts"
@@ -120,11 +157,308 @@ exit 0
 SCRIPT
 chmod +x "$FAKE_BIN"
 
-# ── Inject only this plugin; its config hook applies native-tool replacement ─
-export OPENCODE_CONFIG_CONTENT="$(printf '{"plugin":["file://%s"]}' "$PLUGIN_DIR")"
-export OPENCODE_PERMISSION='{"agentgrep":"allow","external_directory":"allow"}'
+# ── Deterministic local capture LLM (Python 3 HTTP server) ──────────────────
+# This server replaces the need for a real remote model. It listens on a
+# random localhost port, captures every outbound request body to JSONL, and
+# responds with deterministic SSE chat-completions chunks:
+#   - Title/summary requests (no tools): return plain text.
+#   - Main agent requests (containing function tools array): return a
+#     canonical agentgrep tool call with the correct phase mode and
+#     expected query/terms.
+#   - Tool-result requests (containing role=tool messages): return final
+#     text containing the expected fake result summary.
+cat >"$SANDBOX/capture_server.py" <<'PYTHON_SCRIPT'
+import json, os, sys, http.server, uuid, time, re
+
+CAPTURE_LOG = os.environ.get("CAPTURE_LOG", "")
+CAPTURE_PORT = int(os.environ.get("CAPTURE_PORT", "0"))
+
+# Phase state tracking: per-run, track whether we've already emitted a
+# tool call for the main request.
+_grep_tool_called = False
+_find_tool_called = False
+
+# We use a simple JSONL log. Each line is one request body.
+def log_request(body: dict):
+    path = CAPTURE_LOG
+    if not path:
+        return
+    with open(path, "a") as f:
+        f.write(json.dumps(body) + "\n")
+
+def make_chunk(id_str: str, created: int, model: str,
+               delta: dict, finish_reason=None):
+    choice = {"index": 0, "delta": delta}
+    if finish_reason is not None:
+        choice["finish_reason"] = finish_reason
+    return {
+        "id": id_str,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [choice],
+    }
+
+def sse_line(data: dict) -> str:
+    return "data: " + json.dumps(data, separators=(",", ":")) + "\n\n"
+
+def build_tool_call_response(body: dict):
+    """Build SSE response for a main request (has tools array)."""
+    global _grep_tool_called, _find_tool_called
+    uid = str(uuid.uuid4())[:8]
+    now = int(time.time())
+    model = body.get("model", "capture-model")
+
+    # Determine phase from user content.
+    user_content = ""
+    for msg in body.get("messages", []):
+        if isinstance(msg.get("content"), str):
+            user_content += msg["content"]
+        elif isinstance(msg.get("content"), list):
+            for c in msg["content"]:
+                if isinstance(c, dict) and c.get("type") == "text":
+                    user_content += c.get("text", "")
+
+    is_grep = "passthroughStream" in user_content
+    is_find = not is_grep
+
+    # Determine if we already emitted a tool call for this phase.
+    already_called = (_grep_tool_called if is_grep else _find_tool_called)
+
+    if not already_called:
+        # Mark called and return a tool call.
+        if is_grep:
+            _grep_tool_called = True
+        else:
+            _find_tool_called = True
+
+        tool_args = (
+            json.dumps({"mode": "grep", "query": "passthroughStream"})
+            if is_grep
+            else json.dumps({"mode": "find", "terms": ["session", "store"]})
+        )
+        tid = f"call_oc_smoke_{uid}"
+
+        yield sse_line(make_chunk(
+            f"chatcmpl-{uid}", now, model,
+            {"role": "assistant", "tool_calls": [
+                {"index": 0, "id": tid, "type": "function",
+                 "function": {"name": "agentgrep", "arguments": tool_args}}
+            ]},
+        ))
+        yield sse_line(make_chunk(
+            f"chatcmpl-{uid}", now, model,
+            {},
+            finish_reason="tool_calls",
+        ))
+        yield "data: [DONE]\n\n"
+        return
+
+    # Already called this phase — emit final text to break any loop.
+    text = (
+        "passthroughStream (19 matches across 6 files); passthroughStream.ts:1, src/a.ts:2"
+        if is_grep
+        else "FILES: session-store.ts, src/store.ts"
+    )
+    yield sse_line(make_chunk(
+        f"chatcmpl-{uid}", now, model,
+        {"role": "assistant", "content": text},
+    ))
+    yield sse_line(make_chunk(
+        f"chatcmpl-{uid}", now, model,
+        {},
+        finish_reason="stop",
+    ))
+    yield "data: [DONE]\n\n"
+
+def build_text_response(body: dict):
+    """Build SSE response for a title/summary or tool-result request."""
+    uid = str(uuid.uuid4())[:8]
+    now = int(time.time())
+    model = body.get("model", "capture-model")
+
+    # Check if this is a tool-result request (has role=tool messages).
+    has_tool_result = any(
+        isinstance(m, dict) and m.get("role") == "tool"
+        for m in body.get("messages", [])
+    )
+
+    if has_tool_result:
+        # Determine phase from user content.
+        user_content = ""
+        for msg in body.get("messages", []):
+            if isinstance(msg.get("content"), str):
+                user_content += msg["content"]
+            elif isinstance(msg.get("content"), list):
+                for c in msg["content"]:
+                    if isinstance(c, dict) and c.get("type") == "text":
+                        user_content += c.get("text", "")
+        is_grep = "passthroughStream" in user_content
+        text = (
+            "passthroughStream (19 matches across 6 files); passthroughStream.ts:1, src/a.ts:2"
+            if is_grep
+            else "FILES: session-store.ts, src/store.ts"
+        )
+    else:
+        # Title/summary request — return generic text.
+        text = "This is a deterministic capture model for the agentgrep selection smoke test."
+
+    yield sse_line(make_chunk(
+        f"chatcmpl-{uid}", now, model,
+        {"role": "assistant", "content": text},
+    ))
+    yield sse_line(make_chunk(
+        f"chatcmpl-{uid}", now, model,
+        {},
+        finish_reason="stop",
+    ))
+    yield "data: [DONE]\n\n"
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass  # Suppress default logging to stderr.
+
+    def do_GET(self):
+        if self.path == "/v1/models":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            data = {
+                "object": "list",
+                "data": [{"id": "capture-model", "object": "model"}],
+            }
+            self.wfile.write(json.dumps(data).encode())
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def do_POST(self):
+        if self.path == "/v1/chat/completions":
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length)
+            body = json.loads(raw.decode("utf-8"))
+            log_request(body)
+
+            # Determine if this is a main request (has tools array).
+            has_tools = bool(body.get("tools"))
+            response_gen = (
+                build_tool_call_response(body)
+                if has_tools
+                else build_text_response(body)
+            )
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            for chunk in response_gen:
+                self.wfile.write(chunk.encode("utf-8"))
+                self.wfile.flush()
+            self.close_connection = True
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.end_headers()
+
+if __name__ == "__main__":
+    port = CAPTURE_PORT
+    if port <= 0:
+        port = 0  # OS-assign
+    server = http.server.HTTPServer(("127.0.0.1", port), Handler)
+    actual_port = server.server_address[1]
+    # Write the port to a file so the parent shell can read it.
+    port_file = os.environ.get("CAPTURE_PORT_FILE", "")
+    if port_file:
+        with open(port_file, "w") as f:
+            f.write(str(actual_port))
+    # Signal readiness by writing to the pid file.
+    pid_file = os.environ.get("CAPTURE_PID_FILE", "")
+    if pid_file:
+        with open(pid_file, "w") as f:
+            f.write(str(os.getpid()))
+    sys.stdout.flush()
+    server.serve_forever()
+PYTHON_SCRIPT
+
+# Start the capture server.
+export CAPTURE_LOG="$CAPTURE_LOG"
+export CAPTURE_PORT_FILE="$CAPTURE_PORT_FILE"
+export CAPTURE_PID_FILE="$CAPTURE_PID_FILE"
+export CAPTURE_PORT=0  # OS-assign
+
+python3 "$SANDBOX/capture_server.py" &
+CAPTURE_PID=$!
+echo "  [capture] starting capture LLM server (PID $CAPTURE_PID)..." >&2
+
+# Wait for the server to write its port file and be ready.
+CAPTURE_PORT=""
+for _ in $(seq 1 15); do
+  if ! kill -0 "$CAPTURE_PID" 2>/dev/null; then
+    echo "ERROR: capture LLM server exited early." >&2
+    exit 1
+  fi
+  if [[ -f "$CAPTURE_PORT_FILE" ]]; then
+    CAPTURE_PORT="$(cat "$CAPTURE_PORT_FILE")"
+    if [[ -n "$CAPTURE_PORT" ]]; then
+      break
+    fi
+  fi
+  sleep 0.2
+done
+
+if [[ -z "$CAPTURE_PORT" ]]; then
+  echo "ERROR: capture LLM server did not start within timeout." >&2
+  kill "$CAPTURE_PID" 2>/dev/null || true
+  exit 1
+fi
+
+echo "  [capture] capture LLM server listening on 127.0.0.1:$CAPTURE_PORT" >&2
+
+# ── Inject plugin + capture provider; no live model needed ──────────────────
+# The OPENCODE_CONFIG_CONTENT registers the plugin AND a local OpenAI-compatible
+# provider pointing at our capture server, plus sets model and small_model.
+CAPTURE_BASE_URL="http://127.0.0.1:$CAPTURE_PORT/v1"
+export OPENCODE_CONFIG_CONTENT="$(
+  python3 -c "
+import json
+config = {
+    'plugin': ['file://$PLUGIN_DIR'],
+    'provider': {
+        'oc-smoke-capture': {
+            'npm': '@ai-sdk/openai-compatible',
+            'name': 'OC Smoke Capture',
+            'options': {
+                'baseURL': '$CAPTURE_BASE_URL',
+                'apiKey': 'sk-noop',
+            },
+            'models': {
+                'capture-model': {
+                    'name': 'Capture Model',
+                    'tool_call': True,
+                    'cost': {'input': 0, 'output': 0},
+                    'limit': {'context': 128000, 'output': 4096},
+                },
+            },
+        },
+    },
+    'model': 'oc-smoke-capture/capture-model',
+    'small_model': 'oc-smoke-capture/capture-model',
+    'permission': {
+        'agentgrep': 'allow',
+        'external_directory': 'allow',
+    },
+}
+print(json.dumps(config))
+"
+)"
+unset OPENCODE_PERMISSION
 export OPENCODE_SHARED_SERVER=0
-# Ignore repository/project config while retaining user/global model auth.
+# Ignore repository/project config; the injected provider needs no user auth.
 export OPENCODE_DISABLE_PROJECT_CONFIG=1
 
 export TMPDIR="$TMPSTATE"
@@ -159,21 +493,36 @@ timeout_secs="${OC_SMOKE_TIMEOUT:-300}"
 #        endpoint) — the actual absence is proven below by the model-choice
 #        assertions on the real `oc run` tool_use events after the deny is
 #        active (a called-and-denied or unoffered tool never appears as a
-#        native grep/glob tool_use).
-preflight_port="${OC_SMOKE_PREFLIGHT_PORT:-41887}"
+#        native grep/glob tool_use),
+#        AND by the authoritative request-payload assertions on the captured
+#        HTTP request JSON (which inspect the actual tool payload sent to the
+#        model, not the registry).
+reserve_port() {
+  python3 - <<'PY'
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PY
+}
+preflight_port="${OC_SMOKE_PREFLIGHT_PORT:-$(reserve_port)}"
 preflight() {
   local pport="$preflight_port"
   local serve_log="$SANDBOX/preflight-serve.log"
   local ids_file="$SANDBOX/preflight-ids.json"
 
-  "$OC" serve --port "$pport" --hostname 127.0.0.1 >"$serve_log" 2>&1 &
+  setsid "$OC" serve --port "$pport" --hostname 127.0.0.1 >"$serve_log" 2>&1 &
   local pid=$!
+  PREFLIGHT_PID="$pid"
   local ids=""
   local ok=0
   for _ in $(seq 1 30); do
     if ! kill -0 "$pid" 2>/dev/null; then
       echo "PREFLIGHT-FAIL: oc serve exited early (see preflight-serve.log)." >&2
       redact <"$serve_log" | tail -n 20 | sed 's/^/  /' >&2
+      stop_group "$pid"
+      PREFLIGHT_PID=""
       exit 1
     fi
     ids="$(curl -sf --max-time 2 "http://127.0.0.1:$pport/experimental/tool/ids" 2>/dev/null || true)"
@@ -187,11 +536,12 @@ preflight() {
     echo "PREFLIGHT-FAIL: cannot introspect offered tools via GET /experimental/tool/ids on fresh host (curl/serve unavailable)." >&2
     echo "  Introspection unavailable on this oc build — cannot prove registry state. See preflight-serve.log." >&2
     redact <"$serve_log" | tail -n 20 | sed 's/^/  /' >&2
-    kill "$pid" 2>/dev/null || true
+    stop_group "$pid"
+    PREFLIGHT_PID=""
     exit 1
   fi
-  kill "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
+  stop_group "$pid"
+  PREFLIGHT_PID=""
 
   printf '%s' "$ids" >"$ids_file"
 
@@ -211,25 +561,141 @@ preflight() {
   echo "  [preflight] PASS: fresh-host registry advertises canonical agentgrep; introspection route verified live." >&2
 }
 preflight
+
+# ── Request capture assertion helper ─────────────────────────────────────────
+# Inspect the captured HTTP request JSON to prove the actual tool payload
+# sent to the model during `oc run`. This is the authoritative proof that
+# native grep/glob are absent from the model-request payload (the registry
+# preflight above documents the residual — grep/glob are still listed by
+# /experimental/tool/ids but filtered by the deny policy at request time).
+#
+# For each phase (grep/find), we:
+#   1. Identify the main request (the one with non-empty `tools` array).
+#   2. Assert canonical agentgrep is present exactly once.
+#   3. Assert native grep and glob are absent.
+#   4. Preferentially fail if find/Grep/file_grep appear.
+#   5. Record the assertion pass/fail.
+assert_request_payload() {
+  local label="$1"       # "grep" or "find"
+  local capture_file="$2" # path to the JSONL capture file for this run
+
+  if [[ ! -s "$capture_file" ]]; then
+    echo "  [request-payload/$label] FAIL: no captured requests" >&2
+    return 1
+  fi
+
+  local main_request=""
+  local main_index=0
+  local idx=0
+  while IFS= read -r line; do
+    idx=$((idx + 1))
+    if [[ -z "$line" ]]; then continue; fi
+    if echo "$line" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); exit(0 if isinstance(d.get('tools'), list) and len(d['tools']) > 0 else 1)" 2>/dev/null; then
+      main_request="$line"
+      main_index=$idx
+      break
+    fi
+  done <"$capture_file"
+
+  if [[ -z "$main_request" ]]; then
+    echo "  [request-payload/$label] FAIL: no main request (with tools) found in capture"
+    return 1
+  fi
+
+  # Extract tool IDs from the tools array.
+  local tool_ids
+  tool_ids="$(echo "$main_request" | python3 -c "
+import json, sys
+d = json.loads(sys.stdin.read())
+tools = d.get('tools', [])
+ids = [t.get('function', {}).get('name', t.get('id', '')) for t in tools]
+print(' '.join(ids))
+")"
+
+  local agentgrep_count=0
+  local has_grep=0
+  local has_glob=0
+  local has_find=0
+  local has_Grep=0
+  local has_file_grep=0
+
+  for tid in $tool_ids; do
+    case "$tid" in
+      agentgrep) agentgrep_count=$((agentgrep_count + 1)) ;;
+      grep)      has_grep=1 ;;
+      glob)      has_glob=1 ;;
+      find)      has_find=1 ;;
+      Grep)      has_Grep=1 ;;
+      file_grep) has_file_grep=1 ;;
+    esac
+  done
+
+  local ok=0
+  local errors=""
+
+  if [[ "$agentgrep_count" -eq 1 ]]; then
+    :  # exactly one canonical offer — good
+  else
+    errors="$errors; canonical agentgrep offered $agentgrep_count times (expected exactly once)"
+  fi
+
+  if [[ "$has_grep" -eq 1 ]]; then
+    errors="$errors; native grep FOUND in request tool payload (should be absent)"
+    ok=1
+  fi
+  if [[ "$has_glob" -eq 1 ]]; then
+    errors="$errors; native glob FOUND in request tool payload (should be absent)"
+    ok=1
+  fi
+  if [[ "$has_find" -eq 1 ]]; then
+    errors="$errors; native find FOUND in request tool payload (should be absent)"
+    ok=1
+  fi
+  if [[ "$has_Grep" -eq 1 ]]; then
+    errors="$errors; native Grep FOUND in request tool payload (should be absent)"
+    ok=1
+  fi
+  if [[ "$has_file_grep" -eq 1 ]]; then
+    errors="$errors; native file_grep FOUND in request tool payload (should be absent)"
+    ok=1
+  fi
+
+  if [[ -n "$errors" ]]; then
+    echo "  [request-payload/$label] FAIL:$errors" >&2
+    echo "  [request-payload/$label] tool IDs in request: $tool_ids" >&2
+    return 1
+  fi
+
+  echo "  [request-payload/$label] PASS: canonical agentgrep offered exactly once; native grep/glob/find/Grep/file_grep absent" >&2
+  return 0
+}
+
 run_oc() {
   local label="$1"   # human-readable label for diagnostics
   local prompt="$2"  # the prompt to pass to oc run
   local events_out="$3"
   local verdict_out="$4"
+  local capture_file="$5"  # where to save the capture JSONL for this run
 
   # Clear the record for this run (fresh invocation tracking).
   : >"$RECORD"
 
+  # Clear the capture log before this run, then symlink/rename so we can
+  # separate per-run captures.
+  : >"$CAPTURE_LOG"
+
   local run_status=0
-  "$OC" run --format json --print-logs --log-level DEBUG \
-    -m "$OC_SMOKE_MODEL" --dir "$WORKDIR" "$prompt" \
+  setsid "$OC" run --format json --print-logs --log-level DEBUG \
+    -m oc-smoke-capture/capture-model \
+    --dir "$WORKDIR" "$prompt" \
     >"$events_out" 2>"$OC_LOG" &
   local pid=$!
+  RUN_PID="$pid"
   local elapsed=0
   while kill -0 "$pid" 2>/dev/null; do
     if (( elapsed >= timeout_secs )); then
       echo "WATCHDOG [$label]: killing oc run after ${timeout_secs}s" >&2
-      kill -9 "$pid" 2>/dev/null || true
+      stop_group "$pid"
       run_status=137
       break
     fi
@@ -239,8 +705,20 @@ run_oc() {
   if [[ "$run_status" -eq 0 ]]; then
     wait "$pid" || run_status=$?
   fi
+  RUN_PID=""
 
   [[ "$run_status" -eq 0 ]] || fail "[$label] oc run exited $run_status (see stderr tail)"
+
+  # Save the captured requests for this run (the capture log is cleared at
+  # the top of run_oc so each run's requests are separated into its own file).
+  if [[ -f "$CAPTURE_LOG" ]]; then
+    cp "$CAPTURE_LOG" "$capture_file"
+  fi
+
+  # The capture server tracks tool-call state per phase (`_grep_tool_called`
+  # vs `_find_tool_called`) so the grep run and the find run each get exactly
+  # one canonical agentgrep tool call; a repeated main request within a run
+  # (retry) gets final text instead, which breaks any loop deterministically.
 
   # Parse the event stream.
   if command -v python3 >/dev/null 2>&1; then
@@ -341,7 +819,11 @@ fail() {
     python3 - "$EVENTS_GREP" "$EVENTS_FIND" <<'PY' | redact | sed 's/^/  /' >&2 || true
 import json, sys
 for f in sys.argv[1:]:
-    for line in open(f, encoding="utf-8", errors="replace"):
+    try:
+        stream = open(f, encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        continue
+    for line in stream:
         line = line.strip()
         if not line:
             continue
@@ -370,7 +852,8 @@ verdict() { grep -m1 "^$1=" "$2" | cut -d= -f2- ; }
 # ═══════════════════════════════════════════════════════════════════════════════
 PROMPT_GREP='Search this local repository for the exact string passthroughStream using the best available repository code-search tool. Report how many files contain it and the total number of matches.'
 
-run_oc "grep" "$PROMPT_GREP" "$EVENTS_GREP" "$VERDICT_GREP"
+CAPTURE_GREP="$SANDBOX/capture-grep.jsonl"
+run_oc "grep" "$PROMPT_GREP" "$EVENTS_GREP" "$VERDICT_GREP" "$CAPTURE_GREP"
 
 TOOLS_USED="$(verdict TOOLS_USED "$VERDICT_GREP")"
 CODESEARCH_USED="$(verdict CODESEARCH_USED "$VERDICT_GREP")"
@@ -380,6 +863,11 @@ BANNED_SHELL_SEARCH="$(verdict BANNED_SHELL_SEARCH "$VERDICT_GREP")"
 AGENTGREP_INPUT="$(verdict AGENTGREP_INPUT "$VERDICT_GREP")"
 AGENTGREP_CALLS="$(verdict AGENTGREP_CALLS "$VERDICT_GREP")"
 FINAL_TEXT="$(verdict FINAL_TEXT "$VERDICT_GREP")"
+
+# 0a. Authoritative request-payload assertion: inspect the captured HTTP
+# request JSON to prove canonical agentgrep is offered and native grep/glob
+# are absent from the actual tool payload sent to the model.
+assert_request_payload "grep" "$CAPTURE_GREP" || fail "[grep] request-payload assertion failed"
 
 # 1a. At least one local code-search call in this phase, and EVERY code-search
 # call must be canonical `agentgrep` (multi-call runs pass as long as every call
@@ -454,7 +942,8 @@ echo "  [grep] tool uses: $TOOLS_USED" >&2
 # ═══════════════════════════════════════════════════════════════════════════════
 PROMPT_FIND='Find files in this local repository related to session storage. Use the best available repository code-search tool with mode=find to discover relevant files and report what you find.'
 
-run_oc "find" "$PROMPT_FIND" "$EVENTS_FIND" "$VERDICT_FIND"
+CAPTURE_FIND="$SANDBOX/capture-find.jsonl"
+run_oc "find" "$PROMPT_FIND" "$EVENTS_FIND" "$VERDICT_FIND" "$CAPTURE_FIND"
 
 TOOLS_USED="$(verdict TOOLS_USED "$VERDICT_FIND")"
 CODESEARCH_USED="$(verdict CODESEARCH_USED "$VERDICT_FIND")"
@@ -464,6 +953,9 @@ BANNED_SHELL_SEARCH="$(verdict BANNED_SHELL_SEARCH "$VERDICT_FIND")"
 AGENTGREP_INPUT="$(verdict AGENTGREP_INPUT "$VERDICT_FIND")"
 AGENTGREP_CALLS="$(verdict AGENTGREP_CALLS "$VERDICT_FIND")"
 FINAL_TEXT="$(verdict FINAL_TEXT "$VERDICT_FIND")"
+
+# 0b. Authoritative request-payload assertion.
+assert_request_payload "find" "$CAPTURE_FIND" || fail "[find] request-payload assertion failed"
 
 # 1b. At least one local code-search call in this phase, and EVERY code-search
 # call must be canonical `agentgrep` (multi-call runs pass as long as every call
@@ -534,5 +1026,5 @@ echo "  [find] PASS: $code_search_count agentgrep call(s) (all canonical, mode=f
 echo "  [find] tool uses: $TOOLS_USED" >&2
 
 # ═══════════════════════════════════════════════════════════════════════════════
-echo "SMOKE-PASS: both runs passed — exact grep search and ranked find discovery each made 1..$MAX_CALLS local-search calls, all canonical agentgrep with the correct phase mode and phase-matching fake invocations; forbidden bare search/callmux tools were absent; no config-level tools.grep/tools.glob needed (plugin config hook did it)."
+echo "SMOKE-PASS: both runs passed — exact grep search and ranked find discovery each made 1..$MAX_CALLS local-search calls, all canonical agentgrep with the correct phase mode and phase-matching fake invocations; forbidden bare search/callmux tools were absent; no config-level tools.grep/tools.glob needed (plugin config hook did it); request-payload assertions confirmed grep/glob absent from the model-request payload."
 exit 0
