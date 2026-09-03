@@ -31,10 +31,11 @@
 // The legacy `config.tools.grep = false` / `config.tools.glob = false` is
 // preserved as a secondary guard.
 //
-// System guidance: the `experimental.chat.system.transform` hook appends an
-// idempotent, LOCAL-only code-search hint (use `agentgrep` for exact/find/
-// outline/trace; never find/grep/glob/Grep/file_grep;
-// never callmux for local repo search — external MCP/web tasks are untouched).
+// System guidance: when replacement is enabled, the
+// `experimental.chat.system.transform` hook appends an idempotent, LOCAL-only
+// code-search hint (use `agentgrep` for exact/find/outline/trace; never find/
+// grep/glob/Grep/file_grep; never callmux for local repo search — external
+// MCP/web tasks are untouched). The explicit native-search opt-out is a no-op.
 //
 // Everything shells out WITHOUT shell interpolation: argv is assembled by the
 // pure `buildAgentGrepArgs` helper and passed to Bun.spawn as an array. No
@@ -58,6 +59,7 @@ export default (async (input: PluginInput, options?: unknown) => {
     },
     tool: buildAgentGrepTools(input, resolvedOptions),
     "experimental.chat.system.transform": async (_input, output) => {
+      if (!resolvedOptions.replaceNativeSearch) return
       output.system = applyAgentGrepSystemGuidance(output.system)
     },
   }

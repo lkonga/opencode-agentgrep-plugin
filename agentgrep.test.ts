@@ -125,9 +125,26 @@ describe("entrypoint module shape (loader constraint)", () => {
     await transform!({ sessionID: "s", model: {} as never }, output)
     expect(output.system[0]).toBe("existing")
     expect(output.system.some((s) => s.includes(AGENTGREP_GUIDANCE_MARKER))).toBe(true)
+    expect(output.system).toEqual(["existing", agentgrepSystemGuidance()]) // injects EXACTLY the canonical text
     const before = output.system.length
     await transform!({ sessionID: "s", model: {} as never }, output)
     expect(output.system.length).toBe(before) // idempotent: no duplicate guidance
+  })
+
+  test("replaceNativeSearch:false transform hook does not inject or alter the system guidance array (reversible opt-out)", async () => {
+    // The native-search opt-out must be TOTAL: steering the model away from
+    // native grep/glob (via the agentgrep guidance) while the user explicitly
+    // kept those tools would contradict the untouched config. A marker-free
+    // seed array must survive the transform with the SAME reference AND
+    // content — guarded-call so the contract holds whether the hook is
+    // omitted or registered-but-no-op under the opt-out.
+    const hooks = await agentGrepPlugin(makePluginInput(), { replaceNativeSearch: false })
+    const transform = hooks["experimental.chat.system.transform"]
+    const seed = ["existing system line", "second seed line"]
+    const output: { system: string[] } = { system: seed }
+    await transform?.({ sessionID: "s", model: {} as never }, output)
+    expect(output.system).toBe(seed) // same array reference: never re-created
+    expect(output.system).toEqual(seed) // exact content: nothing appended or altered
   })
 })
 

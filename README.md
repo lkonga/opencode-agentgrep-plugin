@@ -106,7 +106,7 @@ The plugin tuple's second element is a portable options object:
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `replaceNativeSearch` | `boolean` | `true` | Disable OpenCode's native `grep`/`glob` tools in the merged config. Set exactly `false` to keep them (reversible). |
+| `replaceNativeSearch` | `boolean` | `true` | Default `true`: disables native `grep`/`glob` in the merged config **and** injects canonical-only local-search system guidance. Exactly `false`: fully reversible opt-out — `grep`/`glob` config left untouched, `experimental.chat.system.transform` a no-op. |
 | `compatibilityAliases` | `"find" \| "file_grep" \| "Grep"[]` | `[]` | Exact tool ids to register **in addition** to canonical `agentgrep`. `find` is never registered implicitly. |
 
 Examples:
@@ -116,14 +116,16 @@ Examples:
 { "plugin": [["@lkonga/opencode-agentgrep", { "compatibilityAliases": ["find", "file_grep", "Grep"] }]] }
 ```
 
-The two options are **independent**: `replaceNativeSearch:false` keeps the
-native tools but does **not** register aliases; `compatibilityAliases`
-registers aliases without changing native-tool behavior.
+The two options are **independent**: `replaceNativeSearch:false` keeps native
+`grep`/`glob` and skips the guidance injection but does **not** register
+aliases; `compatibilityAliases` registers aliases without changing native-tool
+behavior or guidance.
 
 ## Native grep/glob replacement — automatic and reversible
 
-The plugin's `config` hook makes the replacement **total by default** via the
-authoritative policy in `agentgrep-policy.ts`:
+With the default `replaceNativeSearch: true`, the plugin's `config` hook makes
+the replacement **total** via the authoritative policy in
+`agentgrep-policy.ts`:
 
 1. **Permission-level denies** — `config.permission.grep: "deny"` and
    `config.permission.glob: "deny"` are applied at the **global** permission
@@ -135,10 +137,15 @@ authoritative policy in `agentgrep-policy.ts`:
 2. **Legacy guards** — `config.tools.grep = false` / `config.tools.glob = false`
    is kept as a secondary guard (still honored by `resolveTools`).
 
-Everything is **fully reversible**:
+The opt-out is **fully reversible only at exactly `false`** (any other value
+keeps the default policy above):
 
-- Set `["…", { "replaceNativeSearch": false }]` — native `grep`/`glob` stay
-  available for that install.
+- `["…", { "replaceNativeSearch": false }]` leaves the merged `grep`/`glob`
+  config **untouched** (no permission denies, no `tools=false` legacy guards)
+  and makes the `experimental.chat.system.transform` hook a **no-op** — no
+  system-guidance injection or alteration (see "System guidance hook"). Native
+  `grep`/`glob` return exactly as configured; `compatibilityAliases` remains
+  independent.
 - Remove the plugin entry (or uninstall) — OpenCode's upstream defaults return
   untouched; the plugin never modifies OpenCode sources.
 
@@ -292,13 +299,19 @@ elsewhere. This is the documented best-effort subset, not jcode's full
 
 ## System guidance hook
 
-The default plugin attaches an **idempotent** `experimental.chat.system.transform`
-hook (keyed on a stable marker — never duplicated) appending a LOCAL-only
-code-search hint: use `agentgrep` for exact search (mode=grep), outlines
-(mode=outline), traces (mode=trace), and ranked discovery (mode=find); never
-call `find`/`grep`/`glob`/`Grep`/`file_grep` or use callmux for **local**
+Under the default `replaceNativeSearch: true`, the plugin attaches an
+**idempotent** `experimental.chat.system.transform` hook (keyed on a stable
+marker — never duplicated) appending a LOCAL-only code-search hint: use
+`agentgrep` for exact search (mode=grep), outlines (mode=outline), traces
+(mode=trace), and ranked discovery (mode=find); never call
+`find`/`grep`/`glob`/`Grep`/`file_grep` or use callmux for **local**
 repository search (external MCP/web tasks are explicitly carved out). It is a
 hint, not enforcement — the model still decides which tools to call.
+
+With `replaceNativeSearch: false` exactly, the transform hook is a **no-op**:
+it injects no guidance and alters no existing system content — restoring
+upstream system behavior as part of the fully reversible opt-out (see "Native
+grep/glob replacement — automatic and reversible").
 
 ## Executable resolution and environment
 
